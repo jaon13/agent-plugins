@@ -1,0 +1,35 @@
+name: Agent Plugins CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  project-lock-python:
+    name: ProjectLock Python & Installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff & pytest
+        run: python -m pip install --upgrade pip ruff pytest
+      - name: Lint Python
+        run: python -m ruff check plugins/project-lock/scripts plugins/project-lock/tests scripts
+      - name: Run pytest
+        run: python -m pytest plugins/project-lock/tests -v
+      - name: Smoke-test plugin installer
+        run: python scripts/install_plugins.py --plugins-dir /tmp/test-plugins --locks-config /tmp/locks-config.json --init-config
+
+  project-lock-sidecar:
+    name: ProjectLock Sidecar (Node.js)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run lock_board tests
+        run: node --test plugins/project-lock/sidecars/lock_board/tests/lock_board.test.mjs

@@ -1,0 +1,7 @@
+{
+  "name": "dotnet-fast-execution",
+  "displayName": ".NET Fast Execution & Multi-Agent Rules",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg",
+  "description": "Always-on global rules for index-first .NET navigation, FastBuild inner loops, non-polling reactive waits, and worker brief injection across swarm, teamwork, and /boost."
+}

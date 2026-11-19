@@ -1,0 +1,25 @@
+{
+  "workspaceRoot": "D:/Workspace",
+  "sharedSrcGroups": [
+    "00.SharedCore"
+  ],
+  "sharedGroups": [
+    "02.Libraries"
+  ],
+  "appGroups": [
+    "01.Hardware",
+    "03.Utilities",
+    "04.WebServices",
+    "05.Tooling"
+  ],
+  "ignoredScriptFragments": [
+    "code-xray/scripts",
+    "project-lock/scripts"
+  ],
+  "osLockChecks": [
+    {
+      "moduleKey": "00.SharedCore/Shared.Localization",
+      "dllRelPath": "bin/Debug/net10.0/Shared.Localization.Generators.dll"
+    }
+  ]
+}

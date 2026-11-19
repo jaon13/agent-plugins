@@ -1,0 +1,11 @@
+{
+  "rust-stop-gate": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python \"~/.agents/bin/codexray-hook.py\" stop_guard --repo-root auto --lang-filter rust --rustfmt-check",
+        "timeout": 30
+      }
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "project-lock",
+  "displayName": "Project-Unit Concurrency Lock & Dependency Build Guard",
+  "version": "1.1.0",
+  "logo": "assets/logo.svg",
+  "description": "Enforces module-unit concurrency locks across repositories and monorepo workspaces with PreToolUse deny checks, shared dependency build collision guards, Swarm claim/release CLI, and Stop auto-release."
+}

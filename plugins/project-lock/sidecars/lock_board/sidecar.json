@@ -1,0 +1,21 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "Lock & Tooling",
+  "description": "Live ProjectLock SQLite WAL monitor, FIFO wait queue, auto-wake watchdog, and CodeXray/AgentTooling status.",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": false
+  },
+  "ui_config": {
+    "display_name": "Lock & Tooling",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "Lock & Tooling"
+      }
+    ]
+  }
+}

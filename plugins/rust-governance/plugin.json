@@ -1,0 +1,7 @@
+{
+  "name": "rust-governance",
+  "displayName": "Rust Idiomatic Static Analysis & Governance",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg",
+  "description": "Always-on Rust workspace governance rules (Cargo lints, profile-aware safety/async gates, cargo-deny) and Stop consistency hook."
+}

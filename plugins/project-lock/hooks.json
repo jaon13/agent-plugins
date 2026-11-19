@@ -1,0 +1,40 @@
+{
+  "project-lock-guard": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python scripts/project_lock.py session-start",
+        "timeout": 10
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "write_file|edit_file|replace_file_content|multi_replace_file_content|write_to_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/project_lock.py pre-edit",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/project_lock.py pre-command",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python scripts/project_lock.py stop",
+        "timeout": 10
+      }
+    ]
+  }
+}
