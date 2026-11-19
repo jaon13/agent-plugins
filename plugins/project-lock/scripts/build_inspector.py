@@ -199,7 +199,15 @@ MUTATION_HINT_RE = re.compile(
     r"\bcargo\s+(?:build|test|check|clippy|fmt|run)\b)",
     re.IGNORECASE,
 )
-ABS_PATH_RE = re.compile(r'([A-Za-z]:[\\/][^\s"\';|&<>`]+)')
+ABS_PATH_RE = re.compile(
+    r'([A-Za-z]:[\\/][^\s"\';|&<>`]+|'
+    r'(?:(?<=^)|(?<=[\s"\'(=@,:]))/[A-Za-z0-9._~+-]+/[^\s"\';|&<>`),]*)'
+)
+
+
+def _cross_os_name(raw: str) -> str:
+    cleaned = raw.strip("\"'").replace("\\", "/").rstrip("/")
+    return cleaned.rsplit("/", 1)[-1]
 
 
 def split_command_segments(cmd: str) -> list[str]:
@@ -293,11 +301,11 @@ def _is_read_only_python(tokens: list[str], low: str) -> bool:
     if clean_tokens[0] == "-m" and len(clean_tokens) >= MIN_MODULE_ARGS:
         return _is_read_only_python_module(tokens, clean_tokens, low)
 
-    script_name = Path(clean_tokens[0]).name
+    script_name = _cross_os_name(clean_tokens[0])
     if script_name == "xray_run.py" and len(clean_tokens) >= MIN_MODULE_ARGS:
         if clean_tokens[1] in {"-h", "--help"}:
             return True
-        inner_name = Path(clean_tokens[1]).name
+        inner_name = _cross_os_name(clean_tokens[1])
         if inner_name in READ_ONLY_HEADS:
             return True
         return _is_read_only_script(inner_name, set(clean_tokens[2:]))
@@ -352,7 +360,7 @@ def _is_read_only_docker(tokens: list[str]) -> bool:
 
 def _is_read_only_head(tokens: list[str], cleaned: str) -> bool:
     low = cleaned.lower()
-    head_name = Path(tokens[0].strip("\"'")).name.lower()
+    head_name = _cross_os_name(tokens[0]).lower()
     allowed = False
     if head_name in READ_ONLY_HEADS:
         allowed = True
@@ -1232,7 +1240,7 @@ def collect_mutating_module_targets(seg: str, cwd: Path) -> list[ModuleTarget]:
 
     ignored_frags = get_workspace_config().ignored_script_fragments
     for m in ABS_PATH_RE.finditer(seg):
-        raw_p = m.group(1).rstrip(".,:)'\"")
+        raw_p = m.group(0).rstrip(".,:)'\"")
         norm_p = raw_p.replace("\\", "/").lower()
         if any(frag in norm_p for frag in ignored_frags):
             continue

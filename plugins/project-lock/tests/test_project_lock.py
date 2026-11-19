@@ -1058,7 +1058,10 @@ class ProjectLockTests(unittest.TestCase):
 
         decisions: list[str] = []
         for proc in procs:
-            out, err = proc.communicate(timeout=15)
+            assert proc.stdout is not None and proc.stderr is not None
+            out = proc.stdout.read()
+            err = proc.stderr.read()
+            _ = proc.wait(timeout=15)
             self.assertEqual(proc.returncode, 0, f"Worker failed: {err}")
             decisions.append(str(_parse_json_dict(out)["decision"]))
 
