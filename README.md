@@ -10,13 +10,34 @@ Standalone Antigravity governance, build discipline, and concurrency-locking plu
 | `dotnet-fast-execution` | `plugins/dotnet-fast-execution/assets/logo.svg` | Always-on `.NET` index-first navigation (`code-xray`), `-p:FastBuild=true` inner loops, non-polling rules, and Swarm/subagent brief sharding |
 | `rust-governance` | `plugins/rust-governance/assets/logo.svg` | Always-on Rust workspace governance (`Cargo.toml` lints, profile-aware panic/unsafe/async gates, `cargo-deny`) and `Stop` consistency hook |
 
-## Quick Install
+## Quick Install (1-Line Setup)
 
-```bash
-python scripts/install_plugins.py
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/jaon13/agent-plugins/main/install.ps1 | iex
 ```
 
-Then enable the installed plugins inside Antigravity via the **Plugins Manager UI** or `/plugin` (Antigravity manages plugin registration in `~/.gemini/config/config.json`).
+**macOS / Linux (Bash):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/jaon13/agent-plugins/main/install.sh | bash
+```
+
+**Install both `agent-plugins` + `code-xray` together:**
+```powershell
+# Windows
+$env:WITH_CODE_XRAY='1'; irm https://raw.githubusercontent.com/jaon13/agent-plugins/main/install.ps1 | iex
+```
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/jaon13/agent-plugins/main/install.sh | bash -s -- --with-code-xray
+```
+
+**From a local clone:**
+```bash
+python scripts/install_plugins.py --enable
+```
+
+If `agy` CLI is not on `PATH`, enable the installed plugins inside Antigravity via the **Plugins Manager UI** or `/plugin` (never hand-edit `~/.gemini/config/config.json`).
 
 Validate locally with:
 
