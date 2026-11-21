@@ -1,6 +1,6 @@
 <script lang="ts">
   import { SvelteMap } from 'svelte/reactivity';
-  import { formatAgeSeconds, shortConvId } from '../domain/boardPure.ts';
+  import { eventBadgeClass, formatAgeSeconds, shortConvId } from '../domain/boardPure.ts';
   import type { ClaimItem, EventItem, LockItem, QueueItem } from '../types/board.ts';
 
   interface Props {
@@ -183,7 +183,7 @@
         <div class="events-list">
           {#each events.slice(0, 15) as ev (ev.id)}
             <div class="event-row mono">
-              <span class="pill">{ev.event}</span>
+              <span class={eventBadgeClass(ev.event)}>{ev.event}</span>
               <span>{ev.moduleKey || 'system'}</span>
               <span class="muted">{ev.convTitle || shortConvId(ev.convId)} {ev.detail}</span>
             </div>

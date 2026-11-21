@@ -40,6 +40,48 @@ export function shortConvId(convId: string): string {
   return convId.slice(0, 8);
 }
 
+const EVENT_BADGE_MAP: Readonly<Record<string, string>> = {
+  ACQUIRED: 'pill pill-doing',
+  CLAIMED: 'pill pill-doing',
+  WAKE_SENT: 'pill pill-doing',
+  RELEASE: 'pill pill-done',
+  RELEASE_BARRIER: 'pill pill-done',
+  QUEUED: 'pill pill-queue',
+  PROMOTED: 'pill pill-queue',
+  WAKE_DEFERRED: 'pill pill-queue',
+  TTL_EXPIRED: 'pill pill-warn',
+  RESERVATION_EXPIRED: 'pill pill-warn',
+  MANUAL_UNLOCK: 'pill pill-warn',
+  MANUAL_UNLOCK_ALL: 'pill pill-warn',
+  QUEUE_CANCELLED: 'pill pill-warn',
+  DEADLOCK_RISK: 'pill pill-blocked',
+  LIMIT_DENIED: 'pill pill-blocked',
+  DEP_GUARD_DENIED: 'pill pill-blocked',
+  WAKE_FAILED: 'pill pill-blocked',
+  AUTO_WAKE_TOGGLED: 'pill',
+  MIGRATED: 'pill',
+};
+
+export function eventBadgeClass(eventName: string): string {
+  const key = eventName.trim().toUpperCase();
+  const mapped = EVENT_BADGE_MAP[key];
+  if (mapped) return mapped;
+  if (key.includes('DENIED') || key.includes('FAILED') || key.includes('ERROR')) {
+    return 'pill pill-blocked';
+  }
+  if (key.includes('EXPIRED') || key.includes('UNLOCK') || key.includes('CANCEL')) {
+    return 'pill pill-warn';
+  }
+  if (key.includes('QUEUE') || key.includes('PROMOT') || key.includes('DEFER')) {
+    return 'pill pill-queue';
+  }
+  if (key.includes('RELEASE')) return 'pill pill-done';
+  if (key.includes('ACQUIR') || key.includes('CLAIM') || key.startsWith('WAKE_')) {
+    return 'pill pill-doing';
+  }
+  return 'pill';
+}
+
 const TOOL_TASK_STEPS: Readonly<Record<string, string>> = {
   'code-xray': 'Run code-xray MCP analysis.',
   'uia-mcp': 'Inspect active UI tree with rpa-mcp.',

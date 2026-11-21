@@ -26,6 +26,8 @@
     --status-warn-soft: rgb(245 179 66 / 15%);
     --status-done: #66b2ff;
     --status-done-soft: rgb(102 178 255 / 14%);
+    --status-queue: #a78bfa;
+    --status-queue-soft: rgb(167 139 250 / 15%);
     --fs-2xs: 10.5px;
     --fs-xs: 11.5px;
     --fs-sm: 12.5px;

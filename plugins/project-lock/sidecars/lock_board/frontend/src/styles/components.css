@@ -120,6 +120,12 @@
     border-color: transparent;
   }
 
+  .pill-queue {
+    background-color: var(--status-queue-soft);
+    color: var(--status-queue);
+    border-color: transparent;
+  }
+
   .mono {
     font-family: var(--font-mono);
     font-size: var(--fs-xs);

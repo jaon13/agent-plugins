@@ -1342,3 +1342,26 @@ test('Svelte domain pure helpers build combined tooling prompt, group Kanban col
   assert.match(xrayPanelSrc, /Execute \(\{selectedToolIds\.length\}\)/);
   assert.match(xrayPanelSrc, /ByteRAG Workspace Cache/);
 });
+
+test('eventBadgeClass assigns distinct semantic badge classes per lock event kind', async () => {
+  const { eventBadgeClass } = await import('../frontend/src/lib/domain/boardPure.ts');
+
+  assert.equal(eventBadgeClass('ACQUIRED'), 'pill pill-doing');
+  assert.equal(eventBadgeClass('CLAIMED'), 'pill pill-doing');
+  assert.equal(eventBadgeClass('WAKE_SENT'), 'pill pill-doing');
+  assert.equal(eventBadgeClass('RELEASE'), 'pill pill-done');
+  assert.equal(eventBadgeClass('RELEASE_BARRIER'), 'pill pill-done');
+  assert.equal(eventBadgeClass('QUEUED'), 'pill pill-queue');
+  assert.equal(eventBadgeClass('PROMOTED'), 'pill pill-queue');
+  assert.equal(eventBadgeClass('WAKE_DEFERRED'), 'pill pill-queue');
+  assert.equal(eventBadgeClass('TTL_EXPIRED'), 'pill pill-warn');
+  assert.equal(eventBadgeClass('RESERVATION_EXPIRED'), 'pill pill-warn');
+  assert.equal(eventBadgeClass('MANUAL_UNLOCK'), 'pill pill-warn');
+  assert.equal(eventBadgeClass('QUEUE_CANCELLED'), 'pill pill-warn');
+  assert.equal(eventBadgeClass('DEADLOCK_RISK'), 'pill pill-blocked');
+  assert.equal(eventBadgeClass('LIMIT_DENIED'), 'pill pill-blocked');
+  assert.equal(eventBadgeClass('DEP_GUARD_DENIED'), 'pill pill-blocked');
+  assert.equal(eventBadgeClass('WAKE_FAILED'), 'pill pill-blocked');
+  assert.equal(eventBadgeClass('AUTO_WAKE_TOGGLED'), 'pill');
+  assert.equal(eventBadgeClass('CUSTOM_DENIED'), 'pill pill-blocked');
+});
