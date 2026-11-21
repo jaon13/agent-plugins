@@ -1,0 +1,45 @@
+@layer tokens {
+  :root {
+    --font-sans: -apple-system, blinkmacsystemfont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", consolas, monospace;
+    --bg-canvas: #0f1115;
+    --bg-surface: #171a20;
+    --bg-elevated: #1e222a;
+    --bg-glass: rgb(26 30 38 / 84%);
+    --bg-hover: rgb(255 255 255 / 5%);
+    --bg-subtle: rgb(255 255 255 / 3%);
+    --border-hairline: rgb(255 255 255 / 9%);
+    --border-strong: rgb(255 255 255 / 16%);
+    --border-focus: rgb(90 169 255 / 55%);
+    --text-primary: #eef1f6;
+    --text-secondary: #a1a9b8;
+    --text-muted: #6e7685;
+    --accent: #4c9eff;
+    --accent-soft: rgb(76 158 255 / 14%);
+    --status-todo: #8d96a6;
+    --status-todo-soft: rgb(141 150 166 / 14%);
+    --status-doing: #34c77b;
+    --status-doing-soft: rgb(52 199 123 / 15%);
+    --status-blocked: #f0625d;
+    --status-blocked-soft: rgb(240 98 93 / 15%);
+    --status-warn: #f5b342;
+    --status-warn-soft: rgb(245 179 66 / 15%);
+    --status-done: #66b2ff;
+    --status-done-soft: rgb(102 178 255 / 14%);
+    --fs-2xs: 10.5px;
+    --fs-xs: 11.5px;
+    --fs-sm: 12.5px;
+    --fs-base: 13.5px;
+    --fs-title: 15px;
+    --radius-sm: 6px;
+    --radius-card: 10px;
+    --radius-pill: 999px;
+    --radius-popover: 12px;
+    --shadow-card: 0 1px 2px rgb(0 0 0 / 28%);
+    --shadow-popover: 0 16px 40px rgb(0 0 0 / 52%), 0 0 0 1px rgb(255 255 255 / 10%);
+    --z-base: 1;
+    --z-sticky: 20;
+    --z-popover: 80;
+    --z-toast: 100;
+  }
+}

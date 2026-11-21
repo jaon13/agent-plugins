@@ -1,0 +1,41 @@
+{
+  "name": "lock-board-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check:lines": "node scripts/check-line-budget.mjs",
+    "check:types": "svelte-check --tsconfig ./tsconfig.json",
+    "check:eslint": "eslint .",
+    "check:stylelint": "stylelint \"src/**/*.css\" \"src/**/*.svelte\"",
+    "check:markuplint": "markuplint index.html \"src/**/*.svelte\"",
+    "check": "npm run check:lines && npm run check:types && npm run check:eslint && npm run check:stylelint && npm run check:markuplint"
+  },
+  "dependencies": {
+    "svelte": "^5.57.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@markuplint/svelte-parser": "^5.4.0",
+    "@markuplint/svelte-spec": "^5.4.0",
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "eslint": "^9.39.5",
+    "eslint-plugin-boundaries": "^5.4.0",
+    "eslint-plugin-functional": "^9.0.2",
+    "eslint-plugin-svelte": "^3.24.1",
+    "globals": "^17.0.0",
+    "markuplint": "^5.6.1",
+    "postcss-html": "^1.8.0",
+    "stylelint": "^17.0.0",
+    "stylelint-config-html": "^1.1.0",
+    "stylelint-config-standard": "^40.0.0",
+    "stylelint-declaration-strict-value": "^1.10.24",
+    "stylelint-high-performance-animation": "^1.11.0",
+    "svelte-check": "^4.7.8",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.57.2",
+    "vite": "^8.3.5"
+  }
+}

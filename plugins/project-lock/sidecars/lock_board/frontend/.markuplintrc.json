@@ -1,0 +1,55 @@
+{
+  "extends": ["markuplint:recommended"],
+  "parser": {
+    "\\.svelte$": "@markuplint/svelte-parser"
+  },
+  "specs": {
+    "\\.svelte$": "@markuplint/svelte-spec"
+  },
+  "rules": {
+    "require-accessible-name": true
+  },
+  "overrideMode": "merge",
+  "overrides": {
+    "./index.html": {
+      "rules": {
+        "require-h1": false
+      },
+      "nodeRules": [
+        {
+          "selector": "script[src=\"/preload.js\"]",
+          "rules": {
+            "performance/script-defer": false
+          }
+        },
+        {
+          "selector": "script:not([src]), style",
+          "rules": {
+            "no-restricted-element": true
+          }
+        },
+        {
+          "selector": "*",
+          "rules": {
+            "no-disallowed-attr": {
+              "options": {
+                "disallowAttrs": ["style", "onclick", "onchange", "oninput", "onsubmit"]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "**/*.svelte": {
+      "rules": {
+        "require-h1": false,
+        "no-event-handler-attr": false,
+        "no-unknown-attr": {
+          "options": {
+            "ignoreAttrs": ["onmouseenter", "onmouseleave", "onfocusin", "onfocusout", "aria-current"]
+          }
+        }
+      }
+    }
+  }
+}
