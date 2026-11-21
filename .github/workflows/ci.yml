@@ -32,4 +32,4 @@ jobs:
         with:
           node-version: "22"
       - name: Run lock_board tests
-        run: node --test plugins/project-lock/sidecars/lock_board/tests/lock_board.test.mjs
+        run: node --test plugins/project-lock/sidecars/lock_board/tests/*.test.mjs
