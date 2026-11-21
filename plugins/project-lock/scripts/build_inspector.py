@@ -374,6 +374,13 @@ def _is_read_only_head(tokens: list[str], cleaned: str) -> bool:
         allowed = _is_read_only_ruff(tokens, low)
     elif head_name in {"ast-grep", "ast-grep.exe", "sg", "sg.exe"}:
         allowed = "--update-all" not in low and " -u" not in f" {low} "
+    elif head_name in {"opengrep", "opengrep.exe"}:
+        allowed = "scan" in low and "--autofix" not in low
+    elif head_name in {"stylelint", "stylelint.cmd", "markuplint", "markuplint.cmd"}:
+        allowed = "--fix" not in low
+    elif head_name in {"node", "node.exe"}:
+        clean_toks = {t.strip("\"'").lower() for t in tokens[1:]}
+        allowed = bool(clean_toks & {"--check", "-c", "--version", "-v"})
     elif head_name in {"python", "python3", "python.exe"}:
         allowed = _is_read_only_python(tokens, low)
     return allowed

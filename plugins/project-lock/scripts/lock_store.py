@@ -27,6 +27,13 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+import claim_store
+from claim_policy import (
+    MODE_PRIORITY,
+    ClaimEntry,
+    claims_conflict,
+    compute_scope_key,
+)
 from lock_config import WorkspaceLockConfig, load_workspace_config
 
 _INITIAL_LOCK_ROOT = Path(
@@ -44,8 +51,11 @@ NEW_ROOT = _INITIAL_NEW_ROOT
 
 DEFAULT_TTL_SECONDS = 1200  # 20 minutes idle safety expiration
 RESERVATION_TTL_SECONDS = 60  # 60s reservation window on promotion
-DEFAULT_MAX_LOCKS_PER_SESSION = 4
+DEFAULT_MAX_LOCKS_PER_SESSION = 8
 DEFAULT_MAX_SHARED_DEPS_WITHOUT_NODEPS = 3
+MAX_RECENT_BRAIN_DIRS = 20
+RECENT_BRAIN_WINDOW_SECONDS = 24 * 60 * 60
+_MAX_LINEAGE_CHAIN_DEPTH = 8
 BUSY_TIMEOUT_MS = 5000
 MAX_ROOT_WALK_DEPTH = 10
 MIN_COMMON_PARTS = 3
@@ -162,6 +172,7 @@ class SessionContext:
     transcript_path: str = ""
     workspace: str = ""
     session_kind: str = "unknown"
+    parent_conv_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -194,6 +205,7 @@ class AcquireResult:
     expired_promotions: tuple[PromotionNotice, ...] = ()
     held_modules: tuple[str, ...] = ()
     limit: int = 0
+    same_team: bool = False
 
 
 @dataclass(frozen=True)
@@ -540,6 +552,28 @@ def _ensure_lock_queue_columns_tx(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_max_locks_default_tx(conn: sqlite3.Connection) -> None:
+    """One-time upgrade of legacy default max_locks_per_session ('4' -> '8')."""
+    migrated = conn.execute(
+        "SELECT value FROM lock_settings WHERE key = 'max_locks_default_v2_8'"
+    ).fetchone()
+    if migrated is not None:
+        return
+    row = conn.execute(
+        "SELECT value FROM lock_settings WHERE key = 'max_locks_per_session'"
+    ).fetchone()
+    if row is not None and _row_str(row, "value").strip() == "4":
+        _ = conn.execute(
+            "INSERT OR REPLACE INTO lock_settings (key, value) "
+            "VALUES ('max_locks_per_session', ?)",
+            (str(DEFAULT_MAX_LOCKS_PER_SESSION),),
+        )
+    _ = conn.execute(
+        "INSERT OR REPLACE INTO lock_settings (key, value) "
+        "VALUES ('max_locks_default_v2_8', '1')"
+    )
+
+
 def init_db() -> Path:
     lock_root = _effective_lock_root()
     lock_root.mkdir(parents=True, exist_ok=True)
@@ -556,6 +590,7 @@ def init_db() -> Path:
                 for stmt in _SCHEMA_STATEMENTS:
                     _ = conn.execute(stmt)
                 _ensure_lock_queue_columns_tx(conn)
+                claim_store.ensure_claim_schema_tx(conn)
                 for setting_key, setting_val in (
                     ("auto_wake_enabled", "1"),
                     ("max_locks_per_session", str(DEFAULT_MAX_LOCKS_PER_SESSION)),
@@ -569,6 +604,7 @@ def init_db() -> Path:
                         "VALUES (?, ?)",
                         (setting_key, setting_val),
                     )
+                _migrate_max_locks_default_tx(conn)
                 _migrate_legacy_json_tx(conn, lock_root, time.time())
             return db_path
         except sqlite3.OperationalError as exc:
@@ -628,17 +664,119 @@ def _row_to_queue_dict(row: sqlite3.Row, position: int = 0) -> QueueDict:
     }
 
 
-def _matches_legacy_spawn_record(
-    obj: dict[str, object],
-    current_conv_id: str,
-) -> bool:
-    if obj.get("type") != "tool_call":
+def _default_brain_roots() -> tuple[Path, ...]:
+    gemini_dir = Path.home() / ".gemini"
+    return (
+        gemini_dir / "antigravity" / "brain",
+        gemini_dir / "antigravity-ide" / "brain",
+        gemini_dir / "antigravity-cli" / "brain",
+    )
+
+
+def _find_brain_transcript(conv_dir: Path) -> Path | None:
+    for rel in (
+        Path(".system_generated") / "logs" / "transcript.jsonl",
+        Path(".system_generated") / "logs" / "transcript_full.jsonl",
+        Path("transcript.jsonl"),
+    ):
+        cand = conv_dir / rel
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _find_brain_transcript_for_conv(
+    conv_id: str,
+    brain_roots: Sequence[Path] | None = None,
+) -> Path | None:
+    if not conv_id or conv_id == "unknown" or Path(conv_id).name != conv_id:
+        return None
+    roots = tuple(brain_roots) if brain_roots is not None else _default_brain_roots()
+    for root in roots:
+        conv_dir = root / conv_id
+        try:
+            if conv_dir.is_dir():
+                tp = _find_brain_transcript(conv_dir)
+                if tp is not None:
+                    return tp
+        except OSError:
+            continue
+    return None
+
+
+def _collect_recent_brain_transcripts(
+    now: float,
+    brain_roots: Sequence[Path] | None = None,
+) -> list[tuple[str, Path]]:
+    roots = tuple(brain_roots) if brain_roots is not None else _default_brain_roots()
+    candidates: list[tuple[float, str, Path]] = []
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for sub in entries:
+            try:
+                if not sub.is_dir() or sub.name.startswith("."):
+                    continue
+                tp = _find_brain_transcript(sub)
+                if tp is None:
+                    continue
+                mtime = tp.stat().st_mtime
+            except OSError:
+                continue
+            if (now - mtime) < RECENT_BRAIN_WINDOW_SECONDS:
+                candidates.append((mtime, sub.name, tp))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    seen_ids: set[str] = set()
+    recent: list[tuple[str, Path]] = []
+    for _, cid, tp in candidates:
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+        recent.append((cid, tp))
+        if len(recent) >= MAX_RECENT_BRAIN_DIRS:
+            break
+    return recent
+
+
+def _file_contains_token(file_path: Path, token: str) -> bool:
+    if not token:
         return False
+    needle = token.encode("utf-8")
+    overlap = max(0, len(needle) - 1)
+    tail = b""
+    try:
+        with file_path.open("rb") as fh:
+            while True:
+                chunk = fh.read(262144)
+                if not chunk:
+                    return False
+                buf = tail + chunk
+                if needle in buf:
+                    return True
+                tail = buf[-overlap:] if overlap else b""
+    except OSError:
+        return False
+
+
+def _extract_legacy_spawn_children(obj: dict[str, object]) -> set[str]:
+    if obj.get("type") != "tool_call":
+        return set()
+    ids: set[str] = set()
     for key in _LEGACY_CHILD_KEYS:
-        if obj.get(key) == current_conv_id:
-            return True
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            ids.add(val.strip())
     children = obj.get("children")
-    return isinstance(children, list) and current_conv_id in children
+    if isinstance(children, list):
+        for item in cast(list[object], children):
+            if isinstance(item, str) and item.strip():
+                ids.add(item.strip())
+    return ids
 
 
 def _count_pending_spawns(obj: dict[str, object]) -> tuple[int, int]:
@@ -728,50 +866,71 @@ def _parse_jsonl_dict(line: str) -> dict[str, object] | None:
     return cast(dict[str, object], raw_obj)
 
 
-def _line_needs_spawn_parse(
-    line: str,
-    current_conv_id: str,
-    pending_subagents: int,
-    pending_swarms: int,
-) -> bool:
-    if current_conv_id in line:
-        return True
-    if '"PLANNER_RESPONSE"' in line:
-        if pending_subagents > 0 or pending_swarms > 0:
-            return True
-        return '"invoke_subagent"' in line or '"swarm"' in line
-    return (pending_subagents > 0 or pending_swarms > 0) and '"GENERIC"' in line
-
-
-def _process_spawn_step(
-    obj: dict[str, object],
-    current_conv_id: str,
-    pending_subagents: int,
-    pending_swarms: int,
-) -> tuple[bool, int, int]:
-    if _matches_legacy_spawn_record(obj, current_conv_id):
-        return True, pending_subagents, pending_swarms
-    step_type = obj.get("type")
-    if step_type == "PLANNER_RESPONSE":
-        sub_cnt, swarm_cnt = _count_pending_spawns(obj)
-        return False, sub_cnt, swarm_cnt
-    if (
-        step_type in _EXCLUDED_TRANSCRIPT_TYPES
-        or obj.get("source") == "USER_EXPLICIT"
-        or step_type != "GENERIC"
-    ):
-        return False, pending_subagents, pending_swarms
-    if pending_subagents <= 0 and pending_swarms <= 0:
-        return False, pending_subagents, pending_swarms
-    content = obj.get("content")
-    if not isinstance(content, str):
-        return False, pending_subagents, pending_swarms
-    kind, child_ids = _extract_spawned_child_ids(content)
-    if kind == "subagent" and pending_subagents > 0:
-        return current_conv_id in child_ids, pending_subagents - 1, pending_swarms
-    if kind == "swarm" and pending_swarms > 0:
-        return current_conv_id in child_ids, pending_subagents, pending_swarms - 1
-    return False, pending_subagents, pending_swarms
+def _extract_spawned_children_from_transcript(transcript_path: str) -> set[str]:
+    """Parse transcript JSONL and return genuine spawned subagent/swarm child IDs."""
+    if not transcript_path:
+        return set()
+    tp = Path(transcript_path)
+    if not tp.is_file():
+        return set()
+    found: set[str] = set()
+    pending_subagents = 0
+    pending_swarms = 0
+    try:
+        with tp.open("r", encoding="utf-8", errors="ignore") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                needs_parse = (
+                    '"tool_call"' in line
+                    or (
+                        '"PLANNER_RESPONSE"' in line
+                        and (
+                            pending_subagents > 0
+                            or pending_swarms > 0
+                            or '"invoke_subagent"' in line
+                            or '"swarm"' in line
+                        )
+                    )
+                    or (
+                        (pending_subagents > 0 or pending_swarms > 0)
+                        and '"GENERIC"' in line
+                    )
+                )
+                if not needs_parse:
+                    continue
+                obj = _parse_jsonl_dict(line)
+                if obj is None:
+                    continue
+                legacy_ids = _extract_legacy_spawn_children(obj)
+                if legacy_ids:
+                    found.update(legacy_ids)
+                step_type = obj.get("type")
+                if step_type == "PLANNER_RESPONSE":
+                    pending_subagents, pending_swarms = _count_pending_spawns(obj)
+                    continue
+                if (
+                    step_type in _EXCLUDED_TRANSCRIPT_TYPES
+                    or obj.get("source") == "USER_EXPLICIT"
+                    or step_type != "GENERIC"
+                ):
+                    continue
+                if pending_subagents <= 0 and pending_swarms <= 0:
+                    continue
+                content = obj.get("content")
+                if not isinstance(content, str):
+                    continue
+                kind, child_ids = _extract_spawned_child_ids(content)
+                if kind == "subagent" and pending_subagents > 0:
+                    found.update(child_ids)
+                    pending_subagents -= 1
+                elif kind == "swarm" and pending_swarms > 0:
+                    found.update(child_ids)
+                    pending_swarms -= 1
+    except OSError:
+        return set()
+    return found
 
 
 def _is_child_of_owner(current_conv_id: str, owner_transcript: str) -> bool:
@@ -781,40 +940,246 @@ def _is_child_of_owner(current_conv_id: str, owner_transcript: str) -> bool:
         or not owner_transcript
     ):
         return False
-    tp = Path(owner_transcript)
-    if not tp.is_file():
-        return False
-    pending_subagents = 0
-    pending_swarms = 0
-    try:
-        with tp.open("r", encoding="utf-8", errors="ignore") as fh:
-            for raw_line in fh:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                if not _line_needs_spawn_parse(
-                    line, current_conv_id, pending_subagents, pending_swarms
-                ):
-                    continue
-                obj = _parse_jsonl_dict(line)
-                if obj is None:
-                    continue
-                matched, pending_subagents, pending_swarms = _process_spawn_step(
-                    obj, current_conv_id, pending_subagents, pending_swarms
-                )
-                if matched:
-                    return True
-    except OSError:
-        return False
-    return False
+    return current_conv_id in _extract_spawned_children_from_transcript(
+        owner_transcript
+    )
 
 
-def _is_same_owner_tree(lock_data: LockDict, conv_id: str) -> bool:
-    owner_id = str(lock_data.get("ownerId") or "")
-    children = _coerce_str_list(lock_data.get("childIds"))
-    if owner_id == conv_id or conv_id in children:
-        return True
-    return _is_child_of_owner(conv_id, str(lock_data.get("ownerTranscriptPath") or ""))
+def _is_same_owner(claim_data: LockDict, conv_id: str) -> bool:
+    return bool(conv_id) and str(claim_data.get("ownerId") or "") == conv_id
+
+
+@dataclass(frozen=True)
+class _LineageDiscovery:
+    parent_by_conv: dict[str, str]
+    transcript_by_conv: dict[str, str]
+    children_by_parent: dict[str, set[str]]
+
+
+def _collect_known_lineage_transcripts_ro(
+    conn: sqlite3.Connection,
+    exclude_conv_id: str,
+) -> list[tuple[str, Path]]:
+    seen_tp: set[str] = set()
+    result: list[tuple[str, Path]] = []
+    for row in conn.execute(
+        """
+        SELECT conv_id, transcript_path FROM session_lineage
+        WHERE transcript_path != '' AND conv_id != ?
+        ORDER BY updated_at DESC LIMIT ?
+        """,
+        (exclude_conv_id, MAX_RECENT_BRAIN_DIRS),
+    ).fetchall():
+        cid = _row_str(row, "conv_id")
+        tp_str = _row_str(row, "transcript_path")
+        if tp_str and tp_str not in seen_tp:
+            tp = Path(tp_str)
+            if tp.is_file():
+                seen_tp.add(tp_str)
+                result.append((cid, tp))
+    for row in conn.execute(
+        """
+        SELECT DISTINCT owner_id, owner_transcript FROM lock_claims
+        WHERE owner_transcript != '' AND owner_id != ?
+        ORDER BY last_active_at DESC LIMIT ?
+        """,
+        (exclude_conv_id, MAX_RECENT_BRAIN_DIRS),
+    ).fetchall():
+        cid = _row_str(row, "owner_id")
+        tp_str = _row_str(row, "owner_transcript")
+        if tp_str and tp_str not in seen_tp:
+            tp = Path(tp_str)
+            if tp.is_file():
+                seen_tp.add(tp_str)
+                result.append((cid, tp))
+    return result
+
+
+def _find_parent_for_conv_ro(
+    conn: sqlite3.Connection,
+    target_conv_id: str,
+    now: float,
+    brain_roots: Sequence[Path] | None,
+    spawn_cache: dict[str, set[str]],
+    brain_index_cache: list[list[tuple[str, Path]] | None],
+) -> tuple[str, str]:
+    known = _collect_known_lineage_transcripts_ro(conn, target_conv_id)
+    seen_tp: set[str] = set()
+
+    def _check_candidates(candidates: Sequence[tuple[str, Path]]) -> tuple[str, str]:
+        for cand_parent, tp_path in candidates:
+            if not cand_parent or cand_parent == target_conv_id:
+                continue
+            tp_key = str(tp_path)
+            if tp_key in seen_tp:
+                continue
+            seen_tp.add(tp_key)
+            if tp_key not in spawn_cache:
+                if not _file_contains_token(tp_path, target_conv_id):
+                    continue
+                spawn_cache[tp_key] = _extract_spawned_children_from_transcript(tp_key)
+            if target_conv_id in spawn_cache[tp_key]:
+                return cand_parent, tp_key
+        return "", ""
+
+    parent_id, tp_str = _check_candidates(known)
+    if parent_id:
+        return parent_id, tp_str
+
+    if brain_index_cache[0] is None:
+        brain_index_cache[0] = _collect_recent_brain_transcripts(now, brain_roots)
+    return _check_candidates(brain_index_cache[0] or ())
+
+
+def _resolve_transcript_for_conv_ro(
+    conn: sqlite3.Connection,
+    cid: str,
+    explicit_tp: str,
+    brain_roots: Sequence[Path] | None,
+) -> str:
+    if explicit_tp and Path(explicit_tp).is_file():
+        return explicit_tp
+    entry = claim_store.get_lineage_entry_tx(conn, cid)
+    if entry is not None and entry["transcriptPath"]:
+        stored_tp = entry["transcriptPath"]
+        if Path(stored_tp).is_file():
+            return stored_tp
+    brain_tp = _find_brain_transcript_for_conv(cid, brain_roots)
+    return str(brain_tp) if brain_tp is not None else ""
+
+
+def _collect_lineage_discovery_ro(
+    conn: sqlite3.Connection,
+    conv_id: str,
+    ctx: SessionContext,
+    now: float,
+    brain_roots: Sequence[Path] | None = None,
+) -> _LineageDiscovery:
+    """Discover session_lineage updates and spawned children outside write lock."""
+    parent_by_conv: dict[str, str] = {}
+    transcript_by_conv: dict[str, str] = {}
+    children_by_parent: dict[str, set[str]] = {}
+    if not conv_id or conv_id == "unknown":
+        return _LineageDiscovery(parent_by_conv, transcript_by_conv, children_by_parent)
+
+    spawn_cache: dict[str, set[str]] = {}
+    brain_index_cache: list[list[tuple[str, Path]] | None] = [None]
+
+    def _scan_transcript(parent_id: str, tp_str: str) -> None:
+        if not tp_str:
+            return
+        if tp_str not in spawn_cache:
+            spawn_cache[tp_str] = _extract_spawned_children_from_transcript(tp_str)
+        kids = spawn_cache[tp_str]
+        if kids:
+            children_by_parent.setdefault(parent_id, set()).update(kids)
+
+    own_tp = _resolve_transcript_for_conv_ro(
+        conn, conv_id, ctx.transcript_path.strip(), brain_roots
+    )
+    if own_tp:
+        transcript_by_conv[conv_id] = own_tp
+        _scan_transcript(conv_id, own_tp)
+
+    explicit_parent = ctx.parent_conv_id.strip()
+    if explicit_parent == conv_id:
+        explicit_parent = ""
+
+    cur = conv_id
+    seen: set[str] = {conv_id}
+    for depth in range(_MAX_LINEAGE_CHAIN_DEPTH):
+        if depth == 0 and explicit_parent:
+            parent_by_conv[cur] = explicit_parent
+            p_entry = claim_store.get_lineage_entry_tx(conn, explicit_parent)
+            p_tp = _resolve_transcript_for_conv_ro(conn, explicit_parent, "", brain_roots)
+            if p_tp:
+                transcript_by_conv[explicit_parent] = p_tp
+                _scan_transcript(explicit_parent, p_tp)
+            if explicit_parent in seen or p_entry is not None:
+                break
+            seen.add(explicit_parent)
+            cur = explicit_parent
+            continue
+
+        cur_entry = claim_store.get_lineage_entry_tx(conn, cur)
+        if cur_entry is not None:
+            parent_by_conv.setdefault(cur, "")
+            break
+
+        found_parent, found_tp = _find_parent_for_conv_ro(
+            conn, cur, now, brain_roots, spawn_cache, brain_index_cache
+        )
+        if not found_parent:
+            parent_by_conv.setdefault(cur, "")
+            break
+        parent_by_conv[cur] = found_parent
+        if found_tp:
+            transcript_by_conv[found_parent] = found_tp
+            _scan_transcript(found_parent, found_tp)
+        if found_parent in seen:
+            break
+        seen.add(found_parent)
+        cur = found_parent
+
+    return _LineageDiscovery(parent_by_conv, transcript_by_conv, children_by_parent)
+
+
+def _apply_lineage_discovery_tx(
+    conn: sqlite3.Connection,
+    discovery: _LineageDiscovery,
+    now: float,
+) -> None:
+    """Persist discovered lineage graph top-down into session_lineage."""
+    all_nodes = (
+        set(discovery.parent_by_conv)
+        | set(discovery.transcript_by_conv)
+        | set(discovery.children_by_parent)
+    )
+    if not all_nodes:
+        return
+
+    ordered: list[str] = []
+    visited: set[str] = set()
+
+    def _visit(node: str, stack: set[str]) -> None:
+        if not node or node == "unknown" or node in visited or node in stack:
+            return
+        stack.add(node)
+        parent = discovery.parent_by_conv.get(node, "")
+        if parent:
+            _visit(parent, stack)
+        stack.remove(node)
+        visited.add(node)
+        ordered.append(node)
+
+    for node in sorted(all_nodes):
+        _visit(node, set())
+
+    for node in ordered:
+        parent = discovery.parent_by_conv.get(node, "")
+        tpath = discovery.transcript_by_conv.get(node, "")
+        root_hint = claim_store.resolve_lineage_root_tx(conn, parent) if parent else ""
+        claim_store.upsert_lineage_tx(
+            conn,
+            node,
+            parent_conv_id=parent,
+            root_conv_id=root_hint,
+            transcript_path=tpath,
+            now=now,
+        )
+
+    for parent_id, children in sorted(discovery.children_by_parent.items()):
+        p_root = claim_store.resolve_lineage_root_tx(conn, parent_id) or parent_id
+        for child_id in sorted(children):
+            if not child_id or child_id == "unknown" or child_id == parent_id:
+                continue
+            claim_store.upsert_lineage_tx(
+                conn,
+                child_id,
+                parent_conv_id=parent_id,
+                root_conv_id=p_root,
+                now=now,
+            )
 
 
 def _is_row_expired(row: sqlite3.Row, now: float, ttl_seconds: int) -> bool:
@@ -839,6 +1204,15 @@ def _load_active_locks_map_tx(
     return active
 
 
+def mode_for_tag(tag: str) -> str:
+    low = tag.strip().lower()
+    if low in {"build", "dep-build"}:
+        return "BUILD_EXCL"
+    if low == "test":
+        return "TEST_SHARED"
+    return "FILE_WRITE"
+
+
 def _promote_next_for_module_tx(
     conn: sqlite3.Connection,
     module_key: str,
@@ -857,7 +1231,7 @@ def _promote_next_for_module_tx(
     if not waiters:
         return None
 
-    active_locks = _load_active_locks_map_tx(conn, now, ttl_seconds)
+    active_claims = claim_store.load_all_claims_tx(conn, now, ttl_seconds)
     for row in waiters:
         req_group = _row_str(row, "request_group_id")
         waiter_id = _row_str(row, "waiter_conv_id")
@@ -869,51 +1243,56 @@ def _promote_next_for_module_tx(
             """,
             (req_group, waiter_id),
         ).fetchall()
-        group_keys = [_row_str(gr, "module_key") for gr in group_rows] or [module_key]
-        if any(
-            gk in active_locks and not _is_same_owner_tree(active_locks[gk], waiter_id)
-            for gk in group_keys
-        ):
-            continue
-
+        rows_to_check = group_rows or [row]
         waiter_proj = _row_str(row, "waiter_project_id")
         waiter_ws = _row_str(row, "waiter_workspace")
         session_kind = _row_str(row, "session_kind")
         reason_tag = _row_str(row, "reason_tag") or "edit"
-        res_until = now + RESERVATION_TTL_SECONDS
 
-        for gk in group_keys:
-            if gk in active_locks:
-                continue
-            mod_root, is_shared = meta_cache.get(gk) or _infer_module_meta(
-                gk, waiter_ws
+        entries: list[ClaimEntry] = []
+        blocked = False
+        for gr in rows_to_check:
+            gk = _row_str(gr, "module_key")
+            mod_root, is_shared = meta_cache.get(gk) or _infer_module_meta(gk, waiter_ws)
+            g_scope = _row_str(gr, "scope_key") or compute_scope_key(gk, Path(mod_root))
+            g_tag = _row_str(gr, "reason_tag") or reason_tag
+            g_mode = _row_str(gr, "lock_mode") or mode_for_tag(g_tag)
+            g_file = _row_str(gr, "file_relpath")
+            if any(
+                not _is_same_owner(c, waiter_id)
+                and claims_conflict(g_scope, g_mode, g_file, c)
+                for c in active_claims
+            ):
+                blocked = True
+                break
+            entries.append(
+                ClaimEntry(
+                    module_key=gk,
+                    module_root=Path(mod_root),
+                    is_shared=is_shared,
+                    scope_key=g_scope,
+                    lock_mode=g_mode,
+                    file_relpath=g_file,
+                    reason_tag=g_tag,
+                )
             )
-            tags = (
-                [reason_tag, "reserved"]
-                if reason_tag != "reserved"
-                else ["reserved"]
+        if blocked:
+            continue
+
+        res_until = now + RESERVATION_TTL_SECONDS
+        group_keys = [e.module_key for e in entries]
+        for entry in entries:
+            _ = claim_store.commit_claim_tx(
+                conn,
+                entry,
+                waiter_id,
+                project_id=waiter_proj,
+                transcript="",
+                workspace=waiter_ws,
+                now=now,
+                reserved_until=res_until,
             )
-            _ = conn.execute(
-                """
-                INSERT OR REPLACE INTO locks (
-                    module_key, module_root, is_shared, owner_id, owner_project_id,
-                    owner_transcript, workspace, child_ids_json, tags_json,
-                    acquired_at, last_active_at, reserved_until
-                ) VALUES (?, ?, ?, ?, ?, '', ?, '[]', ?, ?, ?, ?)
-                """,
-                (
-                    gk,
-                    mod_root,
-                    1 if is_shared else 0,
-                    waiter_id,
-                    waiter_proj,
-                    waiter_ws,
-                    json.dumps(tags, ensure_ascii=False),
-                    now,
-                    now,
-                    res_until,
-                ),
-            )
+        claim_store.sync_legacy_locks_tx(conn, group_keys)
 
         _ = conn.execute(
             """
@@ -948,10 +1327,22 @@ def _expire_stale_and_promote_tx(
     now: float,
     ttl_seconds: int,
 ) -> tuple[list[str], list[PromotionNotice]]:
-    rows = conn.execute("SELECT * FROM locks ORDER BY module_key ASC").fetchall()
+    expired_claims, claim_mods = claim_store.expire_stale_claims_raw_tx(
+        conn, now, ttl_seconds
+    )
     expired_keys: list[str] = []
     meta_cache: dict[str, tuple[str, bool]] = {}
 
+    for mod_key, owner_id, res_until, last_act in expired_claims:
+        if res_until is not None:
+            _log_event_tx(conn, "RESERVATION_EXPIRED", mod_key, owner_id, f"reserved_until={res_until:.3f}")
+        else:
+            idle_s = max(0.0, now - last_act)
+            _log_event_tx(conn, "TTL_EXPIRED", mod_key, owner_id, f"idle={idle_s:.1f}s")
+        if mod_key not in expired_keys:
+            expired_keys.append(mod_key)
+
+    rows = conn.execute("SELECT * FROM locks ORDER BY module_key ASC").fetchall()
     for row in rows:
         if not _is_row_expired(row, now, ttl_seconds):
             continue
@@ -962,30 +1353,24 @@ def _expire_stale_and_promote_tx(
             _row_str(row, "module_root"),
             bool(_row_int(row, "is_shared")),
         )
-
-        if res_until is not None:
-            _log_event_tx(
-                conn,
-                "RESERVATION_EXPIRED",
-                mod_key,
-                owner_id,
-                f"reserved_until={res_until:.3f}",
-            )
-        else:
-            idle_s = max(0.0, now - _row_float(row, "last_active_at"))
-            _log_event_tx(conn, "TTL_EXPIRED", mod_key, owner_id, f"idle={idle_s:.1f}s")
-
+        if mod_key not in claim_mods:
+            if res_until is not None:
+                _log_event_tx(conn, "RESERVATION_EXPIRED", mod_key, owner_id, f"reserved_until={res_until:.3f}")
+            else:
+                idle_s = max(0.0, now - _row_float(row, "last_active_at"))
+                _log_event_tx(conn, "TTL_EXPIRED", mod_key, owner_id, f"idle={idle_s:.1f}s")
         _ = conn.execute(
             "DELETE FROM lock_queue "
             "WHERE module_key = ? AND waiter_conv_id = ? AND status = 'promoted'",
             (mod_key, owner_id),
         )
         _ = conn.execute("DELETE FROM locks WHERE module_key = ?", (mod_key,))
-        expired_keys.append(mod_key)
+        if mod_key not in expired_keys:
+            expired_keys.append(mod_key)
 
     promotions: list[PromotionNotice] = []
     seen_groups: set[tuple[str, str]] = set()
-    for mod_key in expired_keys:
+    for mod_key in sorted(set(expired_keys) | claim_mods):
         promo = _promote_next_for_module_tx(conn, mod_key, now, ttl_seconds, meta_cache)
         if promo is not None:
             gkey = (promo.request_group_id, promo.waiter_conv_id)
@@ -1002,7 +1387,7 @@ def _detect_wait_for_cycle_tx(
     active_locks: dict[str, LockDict],
 ) -> tuple[str, ...] | None:
     held_by_requester = [
-        lk for lk in active_locks.values() if _is_same_owner_tree(lk, requester_conv_id)
+        lk for lk in active_locks.values() if _is_same_owner(lk, requester_conv_id)
     ]
     if not held_by_requester:
         return None
@@ -1018,7 +1403,7 @@ def _detect_wait_for_cycle_tx(
         waiter = _row_str(wrow, "waiter_conv_id")
         wmod = _row_str(wrow, "module_key")
         lock_row = active_locks.get(wmod)
-        if lock_row is None or _is_same_owner_tree(lock_row, waiter):
+        if lock_row is None or _is_same_owner(lock_row, waiter):
             continue
         holder = str(lock_row["ownerId"])
         adj.setdefault(waiter, set()).add(holder)
@@ -1032,7 +1417,7 @@ def _detect_wait_for_cycle_tx(
     while queue:
         node, path = queue.popleft()
         is_cycle_hit = node in requester_ids or any(
-            _is_same_owner_tree(lk, node) for lk in held_by_requester
+            _is_same_owner(lk, node) for lk in held_by_requester
         )
         if is_cycle_hit:
             return path
@@ -1043,25 +1428,28 @@ def _detect_wait_for_cycle_tx(
     return None
 
 
-def _enqueue_group_tx(
+def _enqueue_claim_group_tx(
     conn: sqlite3.Connection,
-    targets: Sequence[tuple[ModuleTarget, str]],
+    entries: Sequence[ClaimEntry],
     conv_id: str,
     ctx: SessionContext,
     now: float,
 ) -> tuple[str, int]:
     request_group_id = f"grp_{uuid.uuid4().hex[:12]}"
-    primary_key = targets[0][0].key
-    for target, tag in targets:
+    primary_key = entries[0].module_key
+    for entry in entries:
         _ = conn.execute(
             """
             INSERT INTO lock_queue (
-                request_group_id, module_key, waiter_conv_id, waiter_project_id,
-                waiter_workspace, session_kind, reason_tag, status, wake_status,
-                retry_count, requested_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', 'pending', 0, ?, ?)
+                request_group_id, module_key, scope_key, lock_mode, file_relpath,
+                waiter_conv_id, waiter_project_id, waiter_workspace, session_kind,
+                reason_tag, status, wake_status, retry_count, requested_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', 'pending', 0, ?, ?)
             ON CONFLICT(module_key, waiter_conv_id) DO UPDATE SET
                 request_group_id = excluded.request_group_id,
+                scope_key = excluded.scope_key,
+                lock_mode = excluded.lock_mode,
+                file_relpath = excluded.file_relpath,
                 waiter_project_id = CASE
                     WHEN excluded.waiter_project_id != ''
                     THEN excluded.waiter_project_id
@@ -1083,12 +1471,15 @@ def _enqueue_group_tx(
             """,
             (
                 request_group_id,
-                target.key,
+                entry.module_key,
+                entry.scope_key,
+                entry.lock_mode,
+                entry.file_relpath,
                 conv_id,
                 ctx.project_id,
                 ctx.workspace,
                 ctx.session_kind,
-                tag,
+                entry.reason_tag,
                 now,
                 now,
             ),
@@ -1107,7 +1498,7 @@ def _enqueue_group_tx(
     _log_event_tx(
         conn,
         "QUEUED",
-        ",".join(t.key for t, _ in targets),
+        ",".join(e.module_key for e in entries),
         conv_id,
         f"group={request_group_id};pos={pos}",
     )
@@ -1218,23 +1609,75 @@ def _dedupe_targets(
 
 
 @dataclass(frozen=True)
-class _ConflictBundle:
+class _ClaimConflictBundle:
     conflicts: list[LockDict]
-    active_locks: dict[str, LockDict]
+    active_claims: list[LockDict]
     expired_promos: list[PromotionNotice]
     enqueue_on_conflict: bool
 
 
-def _handle_conflicts_tx(
+def _sync_missing_conflict_owner_tx(
     conn: sqlite3.Connection,
-    deduped: Sequence[tuple[ModuleTarget, str]],
+    owner_id: str,
+    conflict: LockDict,
+    now: float,
+) -> None:
+    owner_tp = str(conflict.get("ownerTranscriptPath") or "").strip()
+    if not owner_tp or not Path(owner_tp).is_file():
+        brain_tp = _find_brain_transcript_for_conv(owner_id)
+        owner_tp = str(brain_tp) if brain_tp is not None else ""
+    if not owner_tp:
+        return
+    claim_store.upsert_lineage_tx(
+        conn, owner_id, transcript_path=owner_tp, now=now
+    )
+    owner_root = claim_store.resolve_lineage_root_tx(conn, owner_id) or owner_id
+    for child_id in sorted(_extract_spawned_children_from_transcript(owner_tp)):
+        if child_id and child_id != "unknown" and child_id != owner_id:
+            claim_store.upsert_lineage_tx(
+                conn,
+                child_id,
+                parent_conv_id=owner_id,
+                root_conv_id=owner_root,
+                now=now,
+            )
+
+
+def _resolve_same_team_tx(
+    conn: sqlite3.Connection,
+    conv_id: str,
+    conflicts: Sequence[LockDict],
+    now: float,
+) -> bool:
+    if not conv_id or conv_id == "unknown":
+        return False
+    req_root = claim_store.resolve_lineage_root_tx(conn, conv_id)
+    if not req_root:
+        return False
+    for conflict in conflicts:
+        owner_id = str(conflict.get("ownerId") or "")
+        if not owner_id or owner_id == "unknown":
+            continue
+        if claim_store.get_lineage_entry_tx(conn, owner_id) is None:
+            _sync_missing_conflict_owner_tx(conn, owner_id, conflict, now)
+            req_root = claim_store.resolve_lineage_root_tx(conn, conv_id)
+        owner_root = claim_store.resolve_lineage_root_tx(conn, owner_id)
+        if owner_root and owner_root == req_root:
+            return True
+    return False
+
+
+def _handle_claim_conflicts_tx(
+    conn: sqlite3.Connection,
+    entries: Sequence[ClaimEntry],
     tx_ctx: _AcquireTxContext,
-    bundle: _ConflictBundle,
+    bundle: _ClaimConflictBundle,
 ) -> AcquireResult:
     conv_id = tx_ctx.conv_id
     blocking_owners = {str(c["ownerId"]) for c in bundle.conflicts}
-    cycle = _detect_wait_for_cycle_tx(
-        conn, conv_id, blocking_owners, bundle.active_locks
+    same_team = _resolve_same_team_tx(conn, conv_id, bundle.conflicts, tx_ctx.now)
+    cycle = claim_store.detect_claim_cycle_tx(
+        conn, conv_id, blocking_owners, bundle.active_claims, _is_same_owner
     )
     if cycle is not None:
         _log_event_tx(
@@ -1250,20 +1693,19 @@ def _handle_conflicts_tx(
             conflicts=tuple(bundle.conflicts),
             deadlock_chain=cycle,
             expired_promotions=tuple(bundle.expired_promos),
+            same_team=same_team,
         )
 
     req_group = ""
     pos = 0
     if bundle.enqueue_on_conflict:
-        to_queue = [
-            (t, tag)
-            for t, tag in deduped
-            if t.key not in bundle.active_locks
-            or not _is_same_owner_tree(bundle.active_locks[t.key], conv_id)
-            or bundle.active_locks[t.key].get("reservedUntil") is not None
-        ] or list(deduped)
-        req_group, pos = _enqueue_group_tx(
-            conn, to_queue, conv_id, tx_ctx.session, tx_ctx.now
+        by_mod: dict[str, ClaimEntry] = {}
+        for entry in entries:
+            prev = by_mod.get(entry.module_key)
+            if prev is None or MODE_PRIORITY.get(entry.lock_mode, 9) < MODE_PRIORITY.get(prev.lock_mode, 9):
+                by_mod[entry.module_key] = entry
+        req_group, pos = _enqueue_claim_group_tx(
+            conn, list(by_mod.values()), conv_id, tx_ctx.session, tx_ctx.now
         )
 
     return AcquireResult(
@@ -1273,7 +1715,159 @@ def _handle_conflicts_tx(
         request_group_id=req_group,
         queue_position=pos,
         expired_promotions=tuple(bundle.expired_promos),
+        same_team=same_team,
     )
+
+
+def _dedupe_claim_entries(entries: Sequence[ClaimEntry]) -> list[ClaimEntry]:
+    deduped: list[ClaimEntry] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for entry in entries:
+        sig = (
+            entry.scope_key,
+            entry.lock_mode,
+            entry.file_relpath,
+            entry.tool_call_id,
+        )
+        if sig not in seen:
+            seen.add(sig)
+            deduped.append(entry)
+    return deduped
+
+
+def acquire_claims_atomic(
+    entries: Sequence[ClaimEntry],
+    conv_id: str,
+    context: SessionContext | None = None,
+    *,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    enqueue_on_conflict: bool = True,
+    max_locks: int | None = None,
+) -> AcquireResult:
+    """Atomically check compatibility and acquire granular 4-tier claims."""
+    if not entries:
+        return AcquireResult(acquired=True, status="ACQUIRED")
+
+    deduped = _dedupe_claim_entries(entries)
+    tx_ctx = _AcquireTxContext(
+        conv_id=conv_id,
+        session=context or SessionContext(),
+        now=time.time(),
+    )
+
+    with _db_conn() as conn:
+        discovery = _collect_lineage_discovery_ro(
+            conn, conv_id, tx_ctx.session, tx_ctx.now
+        )
+        with _write_tx(conn):
+            _apply_lineage_discovery_tx(conn, discovery, tx_ctx.now)
+            _, expired_promos = _expire_stale_and_promote_tx(
+                conn, tx_ctx.now, ttl_seconds
+            )
+            active_claims = claim_store.load_all_claims_tx(
+                conn, tx_ctx.now, ttl_seconds
+            )
+
+            effective_max = (
+                max_locks
+                if max_locks is not None
+                else _get_int_setting_tx(
+                    conn, "max_locks_per_session", DEFAULT_MAX_LOCKS_PER_SESSION
+                )
+            )
+            owner_held_mods = {
+                str(c["moduleKey"]) for c in active_claims if _is_same_owner(c, conv_id)
+            }
+            requested_mods = {e.module_key for e in deduped}
+            new_mods = requested_mods - owner_held_mods
+            projected_total = len(owner_held_mods | requested_mods)
+            if new_mods and projected_total > effective_max:
+                _log_event_tx(
+                    conn,
+                    "LIMIT_DENIED",
+                    ",".join(sorted(new_mods)),
+                    conv_id,
+                    f"held={len(owner_held_mods)};req={len(requested_mods)};"
+                    f"projected={projected_total};limit={effective_max}",
+                )
+                return AcquireResult(
+                    acquired=False,
+                    status="LIMIT_EXCEEDED",
+                    held_modules=tuple(sorted(owner_held_mods)),
+                    limit=effective_max,
+                    expired_promotions=tuple(expired_promos),
+                )
+
+            conflicts: list[LockDict] = []
+            seen_cids: set[str] = set()
+            for entry in deduped:
+                for c in active_claims:
+                    if _is_same_owner(c, conv_id):
+                        continue
+                    if claims_conflict(
+                        entry.scope_key, entry.lock_mode, entry.file_relpath, c
+                    ):
+                        cid = str(c.get("claimId") or c.get("moduleKey") or "")
+                        if cid not in seen_cids:
+                            seen_cids.add(cid)
+                            conflicts.append(c)
+
+            if conflicts:
+                return _handle_claim_conflicts_tx(
+                    conn,
+                    deduped,
+                    tx_ctx,
+                    _ClaimConflictBundle(
+                        conflicts=conflicts,
+                        active_claims=active_claims,
+                        expired_promos=expired_promos,
+                        enqueue_on_conflict=enqueue_on_conflict,
+                    ),
+                )
+
+            mod_keys = sorted({e.module_key for e in deduped})
+            for entry in deduped:
+                was_res = any(
+                    str(c["moduleKey"]) == entry.module_key
+                    and str(c["ownerId"]) == conv_id
+                    and c.get("reservedUntil") is not None
+                    for c in active_claims
+                )
+                res = claim_store.commit_claim_tx(
+                    conn,
+                    entry,
+                    conv_id,
+                    project_id=tx_ctx.session.project_id,
+                    transcript=tx_ctx.session.transcript_path,
+                    workspace=tx_ctx.session.workspace,
+                    now=tx_ctx.now,
+                )
+                if res is not None and not any(
+                    str(c.get("claimId") or "") == str(res.get("claimId") or "")
+                    and c.get("reservedUntil") is None
+                    for c in active_claims
+                ):
+                    _log_event_tx(
+                        conn,
+                        "CLAIMED" if was_res else "ACQUIRED",
+                        entry.module_key,
+                        conv_id,
+                        f"mode={entry.lock_mode};tag={entry.reason_tag}"
+                        + (f";file={entry.file_relpath}" if entry.file_relpath else ""),
+                    )
+
+            claim_store.sync_legacy_locks_tx(conn, mod_keys)
+            placeholders = ", ".join(["?"] * len(mod_keys))
+            lock_rows = conn.execute(
+                f"SELECT * FROM locks WHERE module_key IN ({placeholders}) ORDER BY module_key ASC",
+                mod_keys,
+            ).fetchall()
+            return AcquireResult(
+                acquired=True,
+                status="ACQUIRED",
+                locks=tuple(_row_to_lock_dict(r) for r in lock_rows),
+                expired_promotions=tuple(expired_promos),
+            )
 
 
 def acquire_atomic_group(
@@ -1285,115 +1879,46 @@ def acquire_atomic_group(
     enqueue_on_conflict: bool = True,
     max_locks: int | None = None,
 ) -> AcquireResult:
-    if not targets:
-        return AcquireResult(acquired=True, status="ACQUIRED")
-
-    deduped = _dedupe_targets(targets)
-    tx_ctx = _AcquireTxContext(
-        conv_id=conv_id,
-        session=context or SessionContext(),
-        now=time.time(),
+    entries = [
+        ClaimEntry(
+            module_key=target.key,
+            module_root=target.root,
+            is_shared=target.is_shared,
+            scope_key=compute_scope_key(target.key, target.root),
+            lock_mode=mode_for_tag(tag),
+            file_relpath="",
+            reason_tag=tag,
+        )
+        for target, tag in targets
+    ]
+    return acquire_claims_atomic(
+        entries,
+        conv_id,
+        context=context,
+        ttl_seconds=ttl_seconds,
+        enqueue_on_conflict=enqueue_on_conflict,
+        max_locks=max_locks,
     )
-
-    with _db_conn() as conn, _write_tx(conn):
-        _, expired_promos = _expire_stale_and_promote_tx(
-            conn, tx_ctx.now, ttl_seconds
-        )
-        active_locks = _load_active_locks_map_tx(conn, tx_ctx.now, ttl_seconds)
-
-        effective_max = (
-            max_locks
-            if max_locks is not None
-            else _get_int_setting_tx(
-                conn, "max_locks_per_session", DEFAULT_MAX_LOCKS_PER_SESSION
-            )
-        )
-        owner_held_keys = {
-            key
-            for key, rec in active_locks.items()
-            if _is_same_owner_tree(rec, conv_id)
-        }
-        requested_keys = {t.key for t, _ in deduped}
-        new_keys = requested_keys - owner_held_keys
-        projected_total = len(owner_held_keys | requested_keys)
-        if new_keys and projected_total > effective_max:
-            _log_event_tx(
-                conn,
-                "LIMIT_DENIED",
-                ",".join(sorted(new_keys)),
-                conv_id,
-                (
-                    f"held={len(owner_held_keys)};"
-                    f"req={len(requested_keys)};"
-                    f"projected={projected_total};"
-                    f"limit={effective_max}"
-                ),
-            )
-            return AcquireResult(
-                acquired=False,
-                status="LIMIT_EXCEEDED",
-                held_modules=tuple(sorted(owner_held_keys)),
-                limit=effective_max,
-                expired_promotions=tuple(expired_promos),
-            )
-
-        conflicts = [
-            active_locks[t.key]
-            for t, _ in deduped
-            if t.key in active_locks
-            and not _is_same_owner_tree(active_locks[t.key], conv_id)
-        ]
-        if conflicts:
-            return _handle_conflicts_tx(
-                conn,
-                deduped,
-                tx_ctx,
-                _ConflictBundle(
-                    conflicts=conflicts,
-                    active_locks=active_locks,
-                    expired_promos=expired_promos,
-                    enqueue_on_conflict=enqueue_on_conflict,
-                ),
-            )
-
-        acquired: list[LockDict] = []
-        for target, tag in deduped:
-            rec = _commit_single_lock_tx(
-                conn,
-                target,
-                tag,
-                tx_ctx,
-                active_locks.get(target.key),
-            )
-            if rec is not None:
-                active_locks[target.key] = rec
-                acquired.append(rec)
-
-        return AcquireResult(
-            acquired=True,
-            status="ACQUIRED",
-            locks=tuple(acquired),
-            expired_promotions=tuple(expired_promos),
-        )
 
 
 def check_lock_conflict(
     target: ModuleTarget,
     conv_id: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    *,
+    lock_mode: str = "FILE_WRITE",
+    file_relpath: str = "",
 ) -> LockDict | None:
     now = time.time()
+    scope_key = compute_scope_key(target.key, target.root)
     with _db_conn() as conn, _write_tx(conn):
         _ = _expire_stale_and_promote_tx(conn, now, ttl_seconds)
-        row = conn.execute(
-            "SELECT * FROM locks WHERE module_key = ?", (target.key,)
-        ).fetchone()
-        if row is None:
-            return None
-        record = _row_to_lock_dict(row)
-        if _is_same_owner_tree(record, conv_id):
-            return None
-        return record
+        for c in claim_store.load_all_claims_tx(conn, now, ttl_seconds):
+            if _is_same_owner(c, conv_id):
+                continue
+            if claims_conflict(scope_key, lock_mode, file_relpath, c):
+                return c
+        return None
 
 
 def acquire_lock(
@@ -1417,6 +1942,54 @@ def acquire_lock(
     return False, (res.conflicts[0] if res.conflicts else {})
 
 
+def release_claims_by_tool_call_with_promotions(
+    conv_id: str,
+    tool_call_id: str,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> ReleaseResult:
+    """Release transient command barriers (by tool_call_id) on PostToolUse."""
+    if not conv_id.strip() or not tool_call_id.strip():
+        return ReleaseResult()
+    now = time.time()
+    with _db_conn() as conn, _write_tx(conn):
+        _, expired_promos = _expire_stale_and_promote_tx(conn, now, ttl_seconds)
+        rows = conn.execute(
+            """
+            SELECT * FROM lock_claims
+            WHERE owner_id = ? AND tool_call_id = ? AND tool_call_id != ''
+            ORDER BY module_key ASC
+            """,
+            (conv_id, tool_call_id),
+        ).fetchall()
+        if not rows:
+            return ReleaseResult(promotions=tuple(expired_promos))
+
+        released: list[LockDict] = []
+        meta_cache: dict[str, tuple[str, bool]] = {}
+        touched_modules: list[str] = []
+        for row in rows:
+            mod_key = _row_str(row, "module_key")
+            meta_cache[mod_key] = (_row_str(row, "module_root"), bool(_row_int(row, "is_shared")))
+            released.append(claim_store.row_to_claim_dict(row))
+            if mod_key not in touched_modules:
+                touched_modules.append(mod_key)
+            _ = conn.execute("DELETE FROM lock_claims WHERE claim_id = ?", (_row_str(row, "claim_id"),))
+
+        claim_store.sync_legacy_locks_tx(conn, touched_modules)
+        promotions = list(expired_promos)
+        seen_groups = {(p.request_group_id, p.waiter_conv_id) for p in promotions}
+        for mod_key in touched_modules:
+            promo = _promote_next_for_module_tx(conn, mod_key, now, ttl_seconds, meta_cache)
+            if promo is not None:
+                gkey = (promo.request_group_id, promo.waiter_conv_id)
+                if gkey not in seen_groups:
+                    seen_groups.add(gkey)
+                    promotions.append(promo)
+
+        _log_event_tx(conn, "RELEASE_BARRIER", ",".join(touched_modules), conv_id, f"tool={tool_call_id}")
+        return ReleaseResult(released=tuple(released), promotions=tuple(promotions))
+
+
 def release_owner_locks_with_promotions(
     conv_id: str,
     module_keys: Sequence[str] | None = None,
@@ -1426,36 +1999,53 @@ def release_owner_locks_with_promotions(
     wanted = {k.strip().lower() for k in module_keys if k.strip()} if module_keys else None
     with _db_conn() as conn, _write_tx(conn):
         _, expired_promos = _expire_stale_and_promote_tx(conn, now, ttl_seconds)
-        rows = conn.execute(
+        claim_rows = conn.execute(
+            "SELECT * FROM lock_claims WHERE owner_id = ? ORDER BY module_key ASC",
+            (conv_id,),
+        ).fetchall()
+        lock_rows = conn.execute(
             "SELECT * FROM locks WHERE owner_id = ? ORDER BY module_key ASC",
             (conv_id,),
         ).fetchall()
         released: list[LockDict] = []
         meta_cache: dict[str, tuple[str, bool]] = {}
+        touched_modules: list[str] = []
 
-        for row in rows:
+        for row in claim_rows:
             mod_key = _row_str(row, "module_key")
             if wanted is not None and mod_key.lower() not in wanted:
                 continue
-            meta_cache[mod_key] = (
-                _row_str(row, "module_root"),
-                bool(_row_int(row, "is_shared")),
-            )
-            released.append(_row_to_lock_dict(row))
-            _ = conn.execute("DELETE FROM locks WHERE module_key = ?", (mod_key,))
+            meta_cache[mod_key] = (_row_str(row, "module_root"), bool(_row_int(row, "is_shared")))
+            released.append(claim_store.row_to_claim_dict(row))
+            if mod_key not in touched_modules:
+                touched_modules.append(mod_key)
+            _ = conn.execute("DELETE FROM lock_claims WHERE claim_id = ?", (_row_str(row, "claim_id"),))
             _ = conn.execute(
                 "DELETE FROM lock_queue "
                 "WHERE module_key = ? AND waiter_conv_id = ? AND status = 'promoted'",
                 (mod_key, conv_id),
             )
 
+        for row in lock_rows:
+            mod_key = _row_str(row, "module_key")
+            if wanted is not None and mod_key.lower() not in wanted:
+                continue
+            meta_cache[mod_key] = (_row_str(row, "module_root"), bool(_row_int(row, "is_shared")))
+            if mod_key not in touched_modules:
+                touched_modules.append(mod_key)
+                released.append(_row_to_lock_dict(row))
+            _ = conn.execute("DELETE FROM locks WHERE module_key = ? AND owner_id = ?", (mod_key, conv_id))
+            _ = conn.execute(
+                "DELETE FROM lock_queue "
+                "WHERE module_key = ? AND waiter_conv_id = ? AND status = 'promoted'",
+                (mod_key, conv_id),
+            )
+
+        claim_store.sync_legacy_locks_tx(conn, touched_modules)
         promotions = list(expired_promos)
         seen_groups = {(p.request_group_id, p.waiter_conv_id) for p in promotions}
-        for rel_rec in released:
-            mod_key = str(rel_rec["moduleKey"])
-            promo = _promote_next_for_module_tx(
-                conn, mod_key, now, ttl_seconds, meta_cache
-            )
+        for mod_key in touched_modules:
+            promo = _promote_next_for_module_tx(conn, mod_key, now, ttl_seconds, meta_cache)
             if promo is not None:
                 gkey = (promo.request_group_id, promo.waiter_conv_id)
                 if gkey not in seen_groups:
@@ -1463,9 +2053,8 @@ def release_owner_locks_with_promotions(
                     promotions.append(promo)
 
         if released:
-            mod_names = [str(r["moduleKey"]) for r in released]
-            _log_event_tx(conn, "RELEASE", ",".join(mod_names), conv_id, "")
-            _append_history("RELEASE", conv_id, mod_names)
+            _log_event_tx(conn, "RELEASE", ",".join(touched_modules), conv_id, "")
+            _append_history("RELEASE", conv_id, touched_modules)
         return ReleaseResult(released=tuple(released), promotions=tuple(promotions))
 
 
@@ -1484,6 +2073,13 @@ def list_active_locks(ttl_seconds: int = DEFAULT_TTL_SECONDS) -> list[LockDict]:
         _ = _expire_stale_and_promote_tx(conn, now, ttl_seconds)
         rows = conn.execute("SELECT * FROM locks ORDER BY module_key ASC").fetchall()
         return [_row_to_lock_dict(row) for row in rows]
+
+
+def list_active_claims(ttl_seconds: int = DEFAULT_TTL_SECONDS) -> list[LockDict]:
+    now = time.time()
+    with _db_conn() as conn, _write_tx(conn):
+        _ = _expire_stale_and_promote_tx(conn, now, ttl_seconds)
+        return claim_store.load_all_claims_tx(conn, now, ttl_seconds)
 
 
 def list_queue(
@@ -1719,24 +2315,37 @@ def _unlock_matching_rows_tx(
 ) -> tuple[list[str], dict[str, tuple[str, bool]]]:
     removed: list[str] = []
     meta_cache: dict[str, tuple[str, bool]] = {}
-    rows = conn.execute("SELECT * FROM locks ORDER BY module_key ASC").fetchall()
-    for row in rows:
+    for row in conn.execute("SELECT * FROM lock_claims ORDER BY module_key ASC").fetchall():
         key = _row_str(row, "module_key")
         row_owner = _row_str(row, "owner_id")
         match_mod = bool(module_key) and key.lower() == module_key.lower()
         match_owner = bool(owner_id) and row_owner.startswith(owner_id)
         if match_mod or match_owner:
-            meta_cache[key] = (
-                _row_str(row, "module_root"),
-                bool(_row_int(row, "is_shared")),
-            )
-            _ = conn.execute("DELETE FROM locks WHERE module_key = ?", (key,))
+            meta_cache[key] = (_row_str(row, "module_root"), bool(_row_int(row, "is_shared")))
+            _ = conn.execute("DELETE FROM lock_claims WHERE claim_id = ?", (_row_str(row, "claim_id"),))
             _ = conn.execute(
-                "DELETE FROM lock_queue "
-                "WHERE module_key = ? AND waiter_conv_id = ? AND status = 'promoted'",
+                "DELETE FROM lock_queue WHERE module_key = ? AND waiter_conv_id = ? AND status = 'promoted'",
                 (key, row_owner),
             )
-            removed.append(key)
+            if key not in removed:
+                removed.append(key)
+
+    for row in conn.execute("SELECT * FROM locks ORDER BY module_key ASC").fetchall():
+        key = _row_str(row, "module_key")
+        row_owner = _row_str(row, "owner_id")
+        match_mod = bool(module_key) and key.lower() == module_key.lower()
+        match_owner = bool(owner_id) and row_owner.startswith(owner_id)
+        if match_mod or match_owner:
+            meta_cache[key] = (_row_str(row, "module_root"), bool(_row_int(row, "is_shared")))
+            _ = conn.execute("DELETE FROM locks WHERE module_key = ?", (key,))
+            _ = conn.execute(
+                "DELETE FROM lock_queue WHERE module_key = ? AND waiter_conv_id = ? AND status = 'promoted'",
+                (key, row_owner),
+            )
+            if key not in removed:
+                removed.append(key)
+
+    claim_store.sync_legacy_locks_tx(conn, removed)
     return removed, meta_cache
 
 
@@ -1754,6 +2363,7 @@ def unlock_locks_with_promotions(
                 "SELECT module_key FROM locks ORDER BY module_key ASC"
             ).fetchall()
             removed = [_row_str(r, "module_key") for r in rows]
+            _ = conn.execute("DELETE FROM lock_claims")
             _ = conn.execute("DELETE FROM locks")
             _ = conn.execute("DELETE FROM lock_queue")
             _log_event_tx(

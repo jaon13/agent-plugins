@@ -19,39 +19,42 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from build_inspector import (
-    collect_build_own_modules,
-    collect_external_shared_dependencies,
-    collect_mutating_module_targets,
-    find_explicit_build_targets,
-    has_no_dependencies_flag,
-    is_dotnet_build_segment,
     is_read_only_command,
-    is_read_only_segment,
     split_command_segments,
+)
+from claim_policy import (
+    ClaimEntry,
+    compute_scope_key,
+    normalize_file_relpath,
+)
+from command_classifier import (
+    ClaimRequestSpec,
+    classify_command_segment,
 )
 from lock_store import (
     DEFAULT_MAX_LOCKS_PER_SESSION,
     DEFAULT_TTL_SECONDS,
     SHORT_ID_LEN,
     AcquireResult,
-    GuardSettings,
     LockDict,
     ModuleTarget,
     PromotionNotice,
     QueueDict,
     SessionContext,
-    acquire_atomic_group,
+    acquire_claims_atomic,
     get_guard_settings,
     infer_module_target,
     is_auto_wake_enabled,
     is_file_os_locked,
     is_git_dirty,
+    list_active_claims,
     list_active_locks,
     list_events,
     list_queue,
     lookup_conversation_summaries,
     mark_wake_status,
     record_event,
+    release_claims_by_tool_call_with_promotions,
     release_owner_locks_with_promotions,
     resolve_module_target,
     unlock_locks_with_promotions,
@@ -101,6 +104,12 @@ def _extract_session_context(
         or ""
     )
     transcript = str(payload.get("transcriptPath") or "")
+    parent_conv_id = str(
+        payload.get("parentConversationId")
+        or payload.get("parent_conversation_id")
+        or os.environ.get("ANTIGRAVITY_PARENT_CONVERSATION_ID")
+        or ""
+    ).strip()
     ws_raw = payload.get("workspacePaths")
     ws = ""
     if isinstance(ws_raw, list):
@@ -112,6 +121,7 @@ def _extract_session_context(
         transcript_path=transcript,
         workspace=ws,
         session_kind=_detect_session_kind(payload, transcript),
+        parent_conv_id=parent_conv_id,
     )
     return conv_id, ctx
 
@@ -125,6 +135,26 @@ def _extract_tool_args(payload: dict[str, object]) -> dict[str, object]:
     if not isinstance(args, dict):
         return {}
     return cast(dict[str, object], args)
+
+
+def _extract_tool_call_id(payload: dict[str, object]) -> str:
+    tool_call = payload.get("toolCall")
+    if isinstance(tool_call, dict):
+        tc_id = cast(dict[str, object], tool_call).get("id")
+        if tc_id:
+            return str(tc_id).strip()
+    alt = payload.get("toolCallId") or payload.get("tool_call_id")
+    return str(alt).strip() if alt else ""
+
+
+def _format_claim_conflict_detail(holder: LockDict) -> str:
+    lock_mode = str(holder.get("lockMode") or "").strip()
+    file_rel = str(holder.get("fileRelpath") or "").strip()
+    if lock_mode == "FILE_WRITE" and file_rel:
+        return f" [FILE_WRITE: {file_rel}]"
+    if lock_mode:
+        return f" [{lock_mode}]"
+    return ""
 
 
 def _pick_primary_conflict(
@@ -162,10 +192,16 @@ def _format_owner_display(holder: LockDict) -> tuple[str, str]:
 def _format_queued_deny(res: AcquireResult, hints_by_key: dict[str, str]) -> str:
     holder, extra_hint = _pick_primary_conflict(res.conflicts, hints_by_key)
     module_key = str(holder.get("moduleKey") or "")
+    mode_detail = _format_claim_conflict_detail(holder)
     owner_label, ws = _format_owner_display(holder)
     raw_acq = holder.get("acquiredAt")
     acq_ts = float(raw_acq) if isinstance(raw_acq, int | float) else time.time()
     elapsed = int(max(0.0, time.time() - acq_ts))
+    team_hint = (
+        " [같은 태스크 팀 보호: 동일 파일/빌드 순서 대기]"
+        if res.same_team
+        else ""
+    )
     hint = f" {extra_hint}" if extra_hint else ""
     queue_info = ""
     if res.request_group_id:
@@ -177,9 +213,9 @@ def _format_queued_deny(res: AcquireResult, hints_by_key: dict[str, str]) -> str
         {
             "decision": "deny",
             "reason": (
-                f"[ProjectLock] 모듈 '{module_key}'이(가) 다른 활성 세션"
+                f"[ProjectLock] 모듈 '{module_key}'{mode_detail}이(가) 다른 활성 세션"
                 f"({owner_label} @ {ws}, {elapsed}s 경과)에 의해 잠겨 있어 "
-                f"차단되었습니다.{hint}{queue_info}"
+                f"차단되었습니다.{team_hint}{hint}{queue_info}"
                 " (/project-lock 또는 "
                 "[Lock & Tooling](sidecar://project-lock/lock_board/)"
                 "에서 락/대기열 확인 가능)"
@@ -192,6 +228,7 @@ def _format_queued_deny(res: AcquireResult, hints_by_key: dict[str, str]) -> str
 def _format_deadlock_deny(res: AcquireResult, hints_by_key: dict[str, str]) -> str:
     holder, extra_hint = _pick_primary_conflict(res.conflicts, hints_by_key)
     module_key = str(holder.get("moduleKey") or "")
+    mode_detail = _format_claim_conflict_detail(holder)
     owner_label, ws = _format_owner_display(holder)
     chain = " -> ".join(c[:SHORT_ID_LEN] for c in res.deadlock_chain) or "cycle"
     hint = f" {extra_hint}" if extra_hint else ""
@@ -199,7 +236,7 @@ def _format_deadlock_deny(res: AcquireResult, hints_by_key: dict[str, str]) -> s
         {
             "decision": "deny",
             "reason": (
-                f"[ProjectLock] DEADLOCK_RISK: 모듈 '{module_key}' 점유 세션"
+                f"[ProjectLock] DEADLOCK_RISK: 모듈 '{module_key}'{mode_detail} 점유 세션"
                 f"({owner_label} @ {ws})이 현재 세션 보유 모듈을 대기 중입니다 "
                 f"(순환: {chain}). 대기열에 등록하지 않고 즉시 차단했습니다.{hint}"
                 " ([Lock & Tooling](sidecar://project-lock/lock_board/) 패널 확인)"
@@ -250,6 +287,7 @@ def _format_dep_guard_deny(
     dep_limit: int,
     max_locks: int,
 ) -> str:
+    effective_max = max_locks if max_locks > 0 else DEFAULT_MAX_LOCKS_PER_SESSION
     dep_preview = ", ".join(sorted(m.key for m in shared_deps)[:MAX_HELD_PREVIEW])
     if len(shared_deps) > MAX_HELD_PREVIEW:
         dep_preview += f" 외 {len(shared_deps) - MAX_HELD_PREVIEW}개"
@@ -262,7 +300,7 @@ def _format_dep_guard_deny(
                 f"임계치({dep_limit}개) 이상이므로 대기열 등록 없이 즉시 차단했습니다. "
                 "`--no-dependencies` (또는 `-p:BuildProjectReferences=false` / "
                 "`--no-build`) 옵션을 전달하거나, 공유 라이브러리를 "
-                f"{max_locks}개 이하 모듈 배치로 분리해 먼저 빌드하세요. "
+                f"{effective_max}개 이하 모듈 배치로 분리해 먼저 빌드하세요. "
                 "([Lock & Tooling](sidecar://project-lock/lock_board/) 패널 확인)"
             ),
         },
@@ -427,28 +465,39 @@ def _wake_promotions(
     return results
 
 
-def _acquire_transactional(
-    groups: list[tuple[list[ModuleTarget], str, str]],
+def _build_claim_entry(spec: ClaimRequestSpec, tool_call_id: str) -> ClaimEntry:
+    t = spec.target
+    return ClaimEntry(
+        module_key=t.key,
+        module_root=t.root,
+        is_shared=t.is_shared,
+        scope_key=compute_scope_key(t.key, t.root),
+        lock_mode=spec.lock_mode,
+        file_relpath=spec.file_relpath,
+        reason_tag=spec.reason_tag,
+        tool_call_id=tool_call_id,
+    )
+
+
+def _acquire_claim_specs(
+    specs: Sequence[ClaimRequestSpec],
     payload: dict[str, object],
-    os_lock_dlls: list[Path] | None = None,
+    *,
+    attach_tool_call_id: bool = False,
 ) -> str | None:
-    for dll in os_lock_dlls or []:
-        if is_file_os_locked(dll):
-            return _format_os_lock_deny(dll)
-
-    targets_with_tags: list[tuple[ModuleTarget, str]] = []
-    hints_by_key: dict[str, str] = {}
-    for targets, tag, hint in groups:
-        for target in targets:
-            targets_with_tags.append((target, tag))
-            if hint and target.key not in hints_by_key:
-                hints_by_key[target.key] = hint
-
-    if not targets_with_tags:
+    if not specs:
         return None
 
+    tool_call_id = _extract_tool_call_id(payload) if attach_tool_call_id else ""
+    entries: list[ClaimEntry] = []
+    hints_by_key: dict[str, str] = {}
+    for spec in specs:
+        entries.append(_build_claim_entry(spec, tool_call_id))
+        if spec.hint and spec.target.key not in hints_by_key:
+            hints_by_key[spec.target.key] = spec.hint
+
     conv_id, ctx = _extract_session_context(payload)
-    res = acquire_atomic_group(targets_with_tags, conv_id, context=ctx)
+    res = acquire_claims_atomic(entries, conv_id, context=ctx)
     if res.expired_promotions:
         _ = _wake_promotions(res.expired_promotions)
 
@@ -472,66 +521,15 @@ def handle_pre_edit(payload: dict[str, object]) -> str:
     if target is None:
         return '{"decision":"allow"}'
 
-    deny = _acquire_transactional([([target], "edit", "")], payload)
-    return deny or '{"decision":"allow"}'
-
-
-def _inspect_dotnet_build_segment(
-    seg: str,
-    cwd: Path,
-    payload: dict[str, object],
-    guard_cache: list[GuardSettings],
-) -> tuple[
-    list[tuple[list[ModuleTarget], str, str]],
-    list[Path],
-    str | None,
-]:
-    build_targets = find_explicit_build_targets(seg, cwd)
-    own_mods = collect_build_own_modules(build_targets, cwd)
-    seg_groups: list[tuple[list[ModuleTarget], str, str]] = []
-    if own_mods:
-        seg_groups.append((own_mods, "build", ""))
-    if has_no_dependencies_flag(seg):
-        return seg_groups, [], None
-
-    own_keys = {m.key for m in own_mods}
-    shared_deps, dll_candidates = collect_external_shared_dependencies(
-        build_targets, own_keys
+    file_rel = normalize_file_relpath(raw_path, target.root, cwd)
+    spec = ClaimRequestSpec(
+        target=target,
+        lock_mode="FILE_WRITE",
+        file_relpath=file_rel,
+        reason_tag="edit",
     )
-    for dll in dll_candidates:
-        if is_file_os_locked(dll):
-            return seg_groups, dll_candidates, _format_os_lock_deny(dll)
-
-    if not guard_cache:
-        guard_cache.append(get_guard_settings())
-    guard = guard_cache[0]
-    if len(shared_deps) >= guard.max_shared_deps_without_nodeps:
-        conv_id, _ = _extract_session_context(payload)
-        record_event(
-            "DEP_GUARD_DENIED",
-            ",".join(sorted(m.key for m in shared_deps)),
-            conv_id,
-            (
-                f"shared={len(shared_deps)};"
-                f"limit={guard.max_shared_deps_without_nodeps}"
-            ),
-        )
-        return (
-            seg_groups,
-            dll_candidates,
-            _format_dep_guard_deny(
-                shared_deps,
-                guard.max_shared_deps_without_nodeps,
-                guard.max_locks_per_session,
-            ),
-        )
-
-    if shared_deps:
-        dep_hint = (
-            "공통 라이브러리 충돌을 피하려면 `--no-dependencies`로 빌드하세요."
-        )
-        seg_groups.append((shared_deps, "dep-build", dep_hint))
-    return seg_groups, dll_candidates, None
+    deny = _acquire_claim_specs([spec], payload, attach_tool_call_id=False)
+    return deny or '{"decision":"allow"}'
 
 
 def handle_pre_command(payload: dict[str, object]) -> str:
@@ -541,33 +539,56 @@ def handle_pre_command(payload: dict[str, object]) -> str:
         return '{"decision":"allow"}'
 
     cwd = Path(str(payload.get("cwd") or ".")).resolve(strict=False)
-    groups: list[tuple[list[ModuleTarget], str, str]] = []
-    dll_checks: list[Path] = []
-    guard_cache: list[GuardSettings] = []
+    specs: list[ClaimRequestSpec] = []
+    conv_id = ""
 
     for seg in split_command_segments(cmd):
-        if is_read_only_segment(seg):
-            continue
-
-        if is_dotnet_build_segment(seg):
-            seg_groups, seg_dlls, immediate_deny = _inspect_dotnet_build_segment(
-                seg, cwd, payload, guard_cache
+        classified = classify_command_segment(
+            seg,
+            cwd,
+            os_lock_checker=is_file_os_locked,
+        )
+        if classified.os_locked_dll is not None:
+            return _format_os_lock_deny(classified.os_locked_dll)
+        if classified.dep_guard_shared:
+            if not conv_id:
+                conv_id, _ = _extract_session_context(payload)
+            record_event(
+                "DEP_GUARD_DENIED",
+                ",".join(sorted(m.key for m in classified.dep_guard_shared)),
+                conv_id,
+                (
+                    f"shared={len(classified.dep_guard_shared)};"
+                    f"limit={classified.dep_guard_limit}"
+                ),
             )
-            if immediate_deny is not None:
-                return immediate_deny
-            groups.extend(seg_groups)
-            dll_checks.extend(seg_dlls)
-            continue
+            return _format_dep_guard_deny(
+                classified.dep_guard_shared,
+                classified.dep_guard_limit,
+                classified.max_locks_limit,
+            )
+        specs.extend(classified.claims)
 
-        mut_targets = collect_mutating_module_targets(seg, cwd)
-        if mut_targets:
-            groups.append((mut_targets, "cmd", ""))
-
-    if not groups and not dll_checks:
+    if not specs:
         return '{"decision":"allow"}'
 
-    deny = _acquire_transactional(groups, payload, os_lock_dlls=dll_checks)
+    deny = _acquire_claim_specs(specs, payload, attach_tool_call_id=True)
     return deny or '{"decision":"allow"}'
+
+
+def handle_post_command(payload: dict[str, object]) -> str:
+    """Release transient command barriers (by tool_call_id) on PostToolUse."""
+    conv_id = str(
+        payload.get("conversationId")
+        or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+        or ""
+    )
+    tool_call_id = _extract_tool_call_id(payload)
+    if conv_id and tool_call_id:
+        rel = release_claims_by_tool_call_with_promotions(conv_id, tool_call_id)
+        if rel.promotions:
+            _ = _wake_promotions(rel.promotions)
+    return "{}"
 
 
 def handle_session_start(payload: dict[str, object]) -> str:
@@ -769,6 +790,7 @@ def _print_enriched_locks(locks: Sequence[LockDict]) -> None:
 
 def cmd_status(as_json: bool = False) -> int:
     locks = list_active_locks()
+    claims = list_active_claims()
     queue = list_queue()
     guard = get_guard_settings()
     enriched_locks, _, _, next_up = _enrich_payload_collections(
@@ -786,6 +808,7 @@ def cmd_status(as_json: bool = False) -> int:
                         guard.max_shared_deps_without_nodeps
                     ),
                     "locks": enriched_locks,
+                    "claims": claims,
                     "nextUp": next_up,
                 },
                 ensure_ascii=False,
@@ -850,6 +873,7 @@ def _print_recent_events(events: Sequence[dict[str, object]]) -> None:
 
 def cmd_queue(as_json: bool = False) -> int:
     locks = list_active_locks()
+    claims = list_active_claims()
     queue = list_queue()
     events = list_events(limit=RECENT_EVENT_LIMIT)
     auto_wake = is_auto_wake_enabled()
@@ -868,6 +892,7 @@ def cmd_queue(as_json: bool = False) -> int:
             "maxLocksPerSession": guard.max_locks_per_session,
             "maxSharedDepsWithoutNodeps": guard.max_shared_deps_without_nodeps,
             "locks": enriched_locks,
+            "claims": claims,
             "queue": enriched_queue,
             "nextUp": next_up,
             "events": enriched_events,
@@ -906,38 +931,89 @@ def cmd_unlock(args: argparse.Namespace) -> int:
     return 0
 
 
+def _infer_claim_file_relpath(
+    spec: str,
+    mod: ModuleTarget,
+    fallback_cwd: Path,
+    lock_mode: str,
+) -> str:
+    if lock_mode != "FILE_WRITE":
+        return ""
+    norm_spec = spec.replace("\\", "/").strip("/").lower()
+    if norm_spec.endswith(mod.key.lower()):
+        return ""
+    return normalize_file_relpath(spec, mod.root, fallback_cwd)
+
+
 def cmd_claim(args: argparse.Namespace) -> int:
     conv_id = str(args.conv_id).strip()
     if not conv_id:
         print("Error: --conv-id is required", file=sys.stderr)
         return 1
     ws = str(args.workspace or "").strip()
-    fallback_cwd = Path(ws).resolve(strict=False) if ws else Path.cwd().resolve(strict=False)
+    fallback_cwd = (
+        Path(ws).resolve(strict=False)
+        if ws
+        else Path.cwd().resolve(strict=False)
+    )
     tag = str(args.tag or "swarm").strip() or "swarm"
+    mode_map = {"file": "FILE_WRITE", "test": "TEST_SHARED", "build": "BUILD_EXCL"}
+    raw_mode = str(getattr(args, "claim_mode", "build") or "build").strip().lower()
+    lock_mode = mode_map.get(raw_mode, "BUILD_EXCL")
 
     raw_specs = [s.strip() for s in str(args.modules or "").split(",") if s.strip()]
-    targets: list[tuple[ModuleTarget, str]] = []
+    claim_entries: list[ClaimEntry] = []
+    first_root = ""
     for spec in raw_specs:
         mod = infer_module_target(spec, fallback_cwd=fallback_cwd)
         if mod is not None:
-            targets.append((mod, tag))
+            if not first_root:
+                first_root = str(mod.root)
+            file_rel = _infer_claim_file_relpath(spec, mod, fallback_cwd, lock_mode)
+            claim_entries.append(
+                ClaimEntry(
+                    module_key=mod.key,
+                    module_root=mod.root,
+                    is_shared=mod.is_shared,
+                    scope_key=compute_scope_key(mod.key, mod.root),
+                    lock_mode=lock_mode,
+                    file_relpath=file_rel,
+                    reason_tag=tag,
+                )
+            )
 
     as_json = bool(args.json)
-    if not targets:
+    if not claim_entries:
         if as_json:
-            print(json.dumps({"acquired": True, "status": "EXEMPT", "convId": conv_id, "locks": []}, ensure_ascii=False))
+            print(
+                json.dumps(
+                    {
+                        "acquired": True,
+                        "status": "EXEMPT",
+                        "convId": conv_id,
+                        "locks": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
         else:
             print(f"Claimed 0 non-exempt module lock(s) for {conv_id[:SHORT_ID_LEN]}.")
         return 0
 
+    parent_conv_id = str(
+        getattr(args, "parent_conv_id", "")
+        or os.environ.get("ANTIGRAVITY_PARENT_CONVERSATION_ID")
+        or ""
+    ).strip()
     ctx = SessionContext(
         project_id=str(args.project_id or "").strip(),
         transcript_path=str(args.owner_transcript or "").strip(),
-        workspace=ws or str(targets[0][0].root),
+        workspace=ws or first_root,
         session_kind="swarm",
+        parent_conv_id=parent_conv_id,
     )
-    res = acquire_atomic_group(
-        targets,
+    res = acquire_claims_atomic(
+        claim_entries,
         conv_id,
         context=ctx,
         enqueue_on_conflict=False,
@@ -950,6 +1026,8 @@ def cmd_claim(args: argparse.Namespace) -> int:
             "acquired": res.acquired,
             "status": res.status,
             "convId": conv_id,
+            "mode": lock_mode,
+            "sameTeam": res.same_team,
             "locks": list(res.locks),
             "conflicts": list(res.conflicts),
             "heldModules": list(res.held_modules),
@@ -1010,10 +1088,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Project-Unit Concurrency Lock Hook & CLI"
     )
-    sub = parser.add_subparsers(dest="mode", required=True)
+    sub = parser.add_subparsers(dest="subcommand", required=True)
     _ = sub.add_parser("session-start")
     _ = sub.add_parser("pre-edit")
     _ = sub.add_parser("pre-command")
+    _ = sub.add_parser("post-command")
     _ = sub.add_parser("stop")
     st = sub.add_parser("status")
     _ = st.add_argument("--json", action="store_true")
@@ -1028,9 +1107,16 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = cl.add_argument("--conv-id", required=True)
     _ = cl.add_argument("--modules", required=True)
     _ = cl.add_argument("--owner-transcript", default="")
+    _ = cl.add_argument("--parent-conv-id", default="")
     _ = cl.add_argument("--workspace", default="")
     _ = cl.add_argument("--project-id", default="")
     _ = cl.add_argument("--tag", default="swarm")
+    _ = cl.add_argument(
+        "--mode",
+        dest="claim_mode",
+        choices=("file", "test", "build"),
+        default="build",
+    )
     _ = cl.add_argument("--json", action="store_true")
     rl = sub.add_parser("release")
     _ = rl.add_argument("--conv-id", required=True)
@@ -1042,7 +1128,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _fallback_hook_output(mode: str) -> str:
     if mode == "stop":
         return '{"decision":"stop"}'
-    if mode == "session-start":
+    if mode in {"session-start", "post-command"}:
         return "{}"
     return '{"decision":"allow"}'
 
@@ -1054,6 +1140,8 @@ def _dispatch_hook_mode(mode: str, payload: dict[str, object]) -> str:
         return handle_pre_edit(payload)
     if mode == "pre-command":
         return handle_pre_command(payload)
+    if mode == "post-command":
+        return handle_post_command(payload)
     return handle_stop(payload)
 
 
@@ -1063,7 +1151,7 @@ def main() -> int:
         reconf(encoding="utf-8")
 
     args = _build_parser().parse_args()
-    mode = str(args.mode)
+    mode = str(args.subcommand)
     if mode == "status":
         return cmd_status(as_json=bool(args.json))
     if mode == "queue":

@@ -40,6 +40,7 @@ class ProjectLockTests(unittest.TestCase):
     fake_temp: Path
     lock_dir: Path
     fake_new: Path
+    fake_brain: Path
     _tmp: tempfile.TemporaryDirectory[str]
     _stack: ExitStack
 
@@ -52,6 +53,8 @@ class ProjectLockTests(unittest.TestCase):
         self.lock_dir.mkdir(parents=True, exist_ok=True)
         self.fake_new = (self.base / "workspace").resolve()
         self.fake_new.mkdir(parents=True, exist_ok=True)
+        self.fake_brain = (self.base / "brain").resolve()
+        self.fake_brain.mkdir(parents=True, exist_ok=True)
         self.config_path = self.lock_dir / "config.json"
         _ = self.config_path.write_text(
             json.dumps(
@@ -91,6 +94,8 @@ class ProjectLockTests(unittest.TestCase):
                     "ANTIGRAVITY_LS_ADDRESS": "",
                     "ANTIGRAVITY_CSRF_TOKEN": "",
                     "ANTIGRAVITY_PROJECT_ID": "",
+                    "ANTIGRAVITY_CONVERSATION_ID": "",
+                    "ANTIGRAVITY_PARENT_CONVERSATION_ID": "",
                 },
             )
         )
@@ -107,6 +112,11 @@ class ProjectLockTests(unittest.TestCase):
         )
         _ = self._stack.enter_context(
             mock.patch.object(lock_store, "NEW_ROOT", self.fake_new)
+        )
+        _ = self._stack.enter_context(
+            mock.patch.object(
+                lock_store, "_default_brain_roots", return_value=(self.fake_brain,)
+            )
         )
         _ = self._stack.enter_context(
             mock.patch.object(project_lock, "is_file_os_locked", return_value=False)
@@ -188,6 +198,10 @@ class ProjectLockTests(unittest.TestCase):
         env["PROJECT_LOCK_WORKSPACE_ROOT"] = str(self.fake_new)
         env["TEMP"] = str(self.fake_temp)
         env["TMP"] = str(self.fake_temp)
+        env["USERPROFILE"] = str(self.base)
+        env["HOME"] = str(self.base)
+        env["ANTIGRAVITY_CONVERSATION_ID"] = ""
+        env["ANTIGRAVITY_PARENT_CONVERSATION_ID"] = ""
         if extra_env:
             env.update(extra_env)
         stdin_str = json.dumps(stdin_obj) if stdin_obj is not None else ""
@@ -413,6 +427,19 @@ class ProjectLockTests(unittest.TestCase):
         )
         self.assertEqual(res2["decision"], "allow")
 
+        sibling_file = str(
+            self.fake_new / "00.SharedCore" / "src" / "Shared.UI" / "Colors.xaml"
+        )
+        res_child_disjoint = _parse_json_dict(
+            project_lock.handle_pre_edit(
+                {
+                    "conversationId": "sub-conv-99",
+                    "toolCall": {"args": {"Path": sibling_file}},
+                }
+            )
+        )
+        self.assertEqual(res_child_disjoint["decision"], "allow")
+
         res_child = _parse_json_dict(
             project_lock.handle_pre_edit(
                 {
@@ -421,7 +448,11 @@ class ProjectLockTests(unittest.TestCase):
                 }
             )
         )
-        self.assertEqual(res_child["decision"], "allow")
+        self.assertEqual(res_child["decision"], "deny")
+        self.assertIn(
+            "[같은 태스크 팀 보호: 동일 파일/빌드 순서 대기]",
+            str(res_child["reason"]),
+        )
 
         res_other = _parse_json_dict(
             project_lock.handle_pre_edit(
@@ -433,15 +464,17 @@ class ProjectLockTests(unittest.TestCase):
         )
         self.assertEqual(res_other["decision"], "deny")
         self.assertIn("00.SharedCore/Shared.UI", str(res_other["reason"]))
-        self.assertEqual(len(lock_store.list_queue()), 1)
+        self.assertNotIn("[같은 태스크 팀 보호:", str(res_other["reason"]))
+        self.assertEqual(len(lock_store.list_queue()), 2)
 
         stop_busy = _parse_json_dict(
             project_lock.handle_stop({"conversationId": "conv-A", "fullyIdle": False})
         )
         self.assertEqual(stop_busy["decision"], "stop")
         self.assertEqual(len(lock_store.list_active_locks()), 1)
+        self.assertEqual(len(lock_store.list_active_claims()), 2)
 
-        # Release promotes conv-B; clear queue for clean TTL test below
+        # Release promotes sub-conv-99; clear queue for clean TTL test below
         stop_idle = _parse_json_dict(
             project_lock.handle_stop({"conversationId": "conv-A", "fullyIdle": True})
         )
@@ -1243,7 +1276,7 @@ class ProjectLockTests(unittest.TestCase):
 
     def test_session_lock_limit_cap_and_reacquire_and_cli_quota(self) -> None:
         guard = lock_store.get_guard_settings()
-        self.assertEqual(guard.max_locks_per_session, 4)
+        self.assertEqual(guard.max_locks_per_session, 8)
         self.assertEqual(guard.max_shared_deps_without_nodeps, 3)
 
         # Inline env vars must NOT override lock_settings guard thresholds
@@ -1255,15 +1288,19 @@ class ProjectLockTests(unittest.TestCase):
             },
         ):
             guard_env = lock_store.get_guard_settings()
-            self.assertEqual(guard_env.max_locks_per_session, 4)
+            self.assertEqual(guard_env.max_locks_per_session, 8)
 
         paths = [
             str(self.fake_new / "00.SharedCore" / "src" / "Shared.UI" / "A.cs"),
             str(self.fake_new / "00.SharedCore" / "src" / "Shared.Core" / "B.cs"),
             str(self.fake_new / "02.Libraries" / "SupportKit" / "C.cs"),
             str(self.fake_new / "05.Tooling" / "01.CodeXray" / "D.rs"),
+            str(self.fake_new / "05.Tooling" / "02.UiAutomationMcp" / "E.cs"),
+            str(self.fake_new / "01.Apps" / "DesktopClient" / "F.cs"),
+            str(self.fake_new / "03.Utilities" / "ToolBox" / "G.cs"),
+            str(self.fake_new / "04.WebServices" / "01.AdminPortal" / "H.rs"),
         ]
-        fifth_path = str(self.fake_new / "05.Tooling" / "02.UiAutomationMcp" / "E.cs")
+        ninth_path = str(self.fake_new / "02.Libraries" / "ExtraKit" / "I.cs")
 
         for idx, fpath in enumerate(paths):
             res = _parse_json_dict(
@@ -1276,67 +1313,67 @@ class ProjectLockTests(unittest.TestCase):
             )
             self.assertEqual(res["decision"], "allow", f"Failed on lock #{idx + 1}")
 
-        self.assertEqual(len(lock_store.list_active_locks()), 4)
+        self.assertEqual(len(lock_store.list_active_locks()), 8)
 
-        # Re-editing already-held 4th lock stays allowed at 4/4
+        # Re-editing already-held 8th lock stays allowed at 8/8
         res_reacquire = _parse_json_dict(
             project_lock.handle_pre_edit(
                 {
                     "conversationId": "conv-cap",
-                    "toolCall": {"args": {"Path": paths[3]}},
+                    "toolCall": {"args": {"Path": paths[7]}},
                 }
             )
         )
         self.assertEqual(res_reacquire["decision"], "allow")
 
-        # Attempting a 5th new module is denied immediately without queueing
-        res_fifth = _parse_json_dict(
+        # Attempting a 9th new module is denied immediately without queueing
+        res_ninth = _parse_json_dict(
             project_lock.handle_pre_edit(
                 {
                     "conversationId": "conv-cap",
-                    "toolCall": {"args": {"Path": fifth_path}},
+                    "toolCall": {"args": {"Path": ninth_path}},
                 }
             )
         )
-        self.assertEqual(res_fifth["decision"], "deny")
-        reason = str(res_fifth["reason"])
+        self.assertEqual(res_ninth["decision"], "deny")
+        reason = str(res_ninth["reason"])
         self.assertIn("LIMIT_DENIED", reason)
-        self.assertIn("4/4", reason)
+        self.assertIn("8/8", reason)
         self.assertIn("sidecar://project-lock/lock_board/", reason)
         self.assertEqual(lock_store.list_queue(), [])
         events = lock_store.list_events(10)
         self.assertTrue(any(e["event"] == "LIMIT_DENIED" for e in events))
 
         # acquire_atomic_group(..., max_locks=...) override & status/queue enrichment
-        mod_fifth = lock_store.resolve_module_target(fifth_path)
-        assert mod_fifth is not None
+        mod_ninth = lock_store.resolve_module_target(ninth_path)
+        assert mod_ninth is not None
         res_custom = lock_store.acquire_atomic_group(
-            [(mod_fifth, "edit")], "conv-cap", max_locks=2
+            [(mod_ninth, "edit")], "conv-cap", max_locks=2
         )
         self.assertFalse(res_custom.acquired)
         self.assertEqual(res_custom.status, "LIMIT_EXCEEDED")
         self.assertEqual(res_custom.limit, 2)
-        self.assertEqual(len(res_custom.held_modules), 4)
+        self.assertEqual(len(res_custom.held_modules), 8)
 
         p_status = self._run_cli(["status", "--json"])
         self.assertEqual(p_status.returncode, 0, p_status.stderr)
         sjson = _parse_json_dict(p_status.stdout)
-        self.assertEqual(sjson["maxLocksPerSession"], 4)
+        self.assertEqual(sjson["maxLocksPerSession"], 8)
         slocks = cast(list[dict[str, object]], sjson["locks"])
-        self.assertEqual(len(slocks), 4)
-        self.assertTrue(all(lk["ownerLockCount"] == 4 for lk in slocks))
-        self.assertTrue(all(lk["maxLocksPerSession"] == 4 for lk in slocks))
+        self.assertEqual(len(slocks), 8)
+        self.assertTrue(all(lk["ownerLockCount"] == 8 for lk in slocks))
+        self.assertTrue(all(lk["maxLocksPerSession"] == 8 for lk in slocks))
 
         p_status_txt = self._run_cli(["status"])
         self.assertEqual(p_status_txt.returncode, 0)
-        self.assertIn("ownerLocks=4/4", p_status_txt.stdout)
+        self.assertIn("ownerLocks=8/8", p_status_txt.stdout)
 
         p_queue = self._run_cli(["queue", "--json"])
         self.assertEqual(p_queue.returncode, 0, p_queue.stderr)
         qjson = _parse_json_dict(p_queue.stdout)
-        self.assertEqual(qjson["maxLocksPerSession"], 4)
+        self.assertEqual(qjson["maxLocksPerSession"], 8)
         qlocks = cast(list[dict[str, object]], qjson["locks"])
-        self.assertEqual(qlocks[0]["ownerLockCount"], 4)
+        self.assertEqual(qlocks[0]["ownerLockCount"], 8)
 
     def test_dep_cascade_guard_three_or_more_vs_two_and_no_deps(self) -> None:
         cm_slnx, _, ui_csproj, gen_csproj = self._make_dotnet_fixture()
@@ -1691,12 +1728,16 @@ class ProjectLockTests(unittest.TestCase):
         self.assertTrue(lock_store._is_child_of_owner("swarm-child-2", str(tp_a)))
         self.assertTrue(lock_store._is_child_of_owner("legacy-child-1", str(tp_a)))
 
-        # Session A acquires 4 locks (at 4/4 cap); unrelated conv-B must NOT inherit them
+        # Session A acquires 8 locks (at 8/8 cap); unrelated conv-B must NOT inherit them
         a_paths = [
             str(self.fake_new / "00.SharedCore" / "src" / "Shared.UI" / "A.cs"),
             str(self.fake_new / "00.SharedCore" / "src" / "Shared.Core" / "B.cs"),
             str(self.fake_new / "02.Libraries" / "SupportKit" / "C.cs"),
             str(self.fake_new / "05.Tooling" / "01.CodeXray" / "D.rs"),
+            str(self.fake_new / "05.Tooling" / "02.UiAutomationMcp" / "E.cs"),
+            str(self.fake_new / "03.Utilities" / "ToolBox" / "G.cs"),
+            str(self.fake_new / "04.WebServices" / "01.AdminPortal" / "H.rs"),
+            str(self.fake_new / "02.Libraries" / "MathKit" / "I.cs"),
         ]
         for fpath in a_paths:
             res = _parse_json_dict(
@@ -1710,7 +1751,7 @@ class ProjectLockTests(unittest.TestCase):
             )
             self.assertEqual(res["decision"], "allow")
 
-        b_path = str(self.fake_new / "05.Tooling" / "02.UiAutomationMcp" / "E.cs")
+        b_path = str(self.fake_new / "01.Apps" / "ExternalApp" / "J.cs")
         res_b = _parse_json_dict(
             project_lock.handle_pre_edit(
                 {
@@ -1721,8 +1762,8 @@ class ProjectLockTests(unittest.TestCase):
         )
         self.assertEqual(res_b["decision"], "allow")
 
-        # Genuine child inherits conv-A's owner tree (re-edit allowed, new 6th module denied)
-        res_child_held = _parse_json_dict(
+        # Genuine child serializes on conv-A's exact same file with team protection hint
+        res_child_same = _parse_json_dict(
             project_lock.handle_pre_edit(
                 {
                     "conversationId": "swarm-child-1",
@@ -1730,10 +1771,29 @@ class ProjectLockTests(unittest.TestCase):
                 }
             )
         )
-        self.assertEqual(res_child_held["decision"], "allow")
+        self.assertEqual(res_child_same["decision"], "deny")
+        self.assertIn(
+            "[같은 태스크 팀 보호: 동일 파일/빌드 순서 대기]",
+            str(res_child_same["reason"]),
+        )
 
+        # Disjoint sibling file in the same module succeeds concurrently
+        child_sibling = str(
+            self.fake_new / "00.SharedCore" / "src" / "Shared.UI" / "Sibling.cs"
+        )
+        res_child_sibling = _parse_json_dict(
+            project_lock.handle_pre_edit(
+                {
+                    "conversationId": "swarm-child-1",
+                    "toolCall": {"args": {"Path": child_sibling}},
+                }
+            )
+        )
+        self.assertEqual(res_child_sibling["decision"], "allow")
+
+        # Child holds an independent per-worker cap=8 even when conv-A is at 8/8
         sixth_path = str(self.fake_new / "01.Apps" / "DesktopClient" / "F.cs")
-        res_child_cap = _parse_json_dict(
+        res_child_distinct = _parse_json_dict(
             project_lock.handle_pre_edit(
                 {
                     "conversationId": "swarm-child-1",
@@ -1741,8 +1801,20 @@ class ProjectLockTests(unittest.TestCase):
                 }
             )
         )
-        self.assertEqual(res_child_cap["decision"], "deny")
-        self.assertIn("LIMIT_DENIED", str(res_child_cap["reason"]))
+        self.assertEqual(res_child_distinct["decision"], "allow")
+
+        ninth_a_path = str(self.fake_new / "01.Apps" / "NinthApp" / "K.cs")
+        res_a_cap = _parse_json_dict(
+            project_lock.handle_pre_edit(
+                {
+                    "conversationId": "conv-A",
+                    "toolCall": {"args": {"Path": ninth_a_path}},
+                }
+            )
+        )
+        self.assertEqual(res_a_cap["decision"], "deny")
+        self.assertIn("LIMIT_DENIED", str(res_a_cap["reason"]))
+        self.assertIn("8/8", str(res_a_cap["reason"]))
 
     def test_standalone_repo_resolution_without_config_json(self) -> None:
         empty_lock_dir = (self.base / "empty_locks").resolve()
