@@ -132,39 +132,44 @@ test('sidecar manifest, package.json, and static asset safety checks pass', asyn
     'SIDECAR_UI_ENTRYPOINT_AUX_PANE'
   );
 
-  const html = readFileSync(join(BOARD_DIR, 'index.html'), 'utf-8');
+  const distDir = join(BOARD_DIR, 'dist');
+  const html = readFileSync(join(distDir, 'index.html'), 'utf-8');
+  assert.match(html, /Content-Security-Policy/);
   assert.match(html, /<script src="\/preload\.js"><\/script>/);
-  assert.match(html, /<link rel="stylesheet" href="\/styles\.css">/);
-  assert.match(html, /<script src="\/app\.js" defer><\/script>/);
-  assert.match(html, /id="tooling-execute-btn"/);
-  assert.match(html, /id="tooling-clear-btn"/);
+  assert.match(html, /<link rel="stylesheet"\s+href="\/styles\.css"/);
+  assert.match(html, /<script[^>]*src="\/app\.js"/);
+  assert.doesNotMatch(html, /\scrossorigin/i);
+  assert.doesNotMatch(html, /type="module"/i);
   assert.doesNotMatch(html, /\son[a-z]+\s*=/i);
   assert.doesNotMatch(html, /\sstyle\s*=/i);
   assert.doesNotMatch(html, /<style[\s>]/i);
 
-  const css = readFileSync(join(BOARD_DIR, 'styles.css'), 'utf-8');
-  assert.match(css, /^@layer\s+tokens,/);
+  const css = readFileSync(join(distDir, 'styles.css'), 'utf-8');
+  assert.match(css, /@layer\s+tokens/);
   assert.doesNotMatch(css, /!important/);
-  assert.doesNotMatch(css, /^\s*#[A-Za-z_-]/m);
-  assert.match(css, /var\(--background/);
-  assert.match(css, /var\(--foreground/);
-  assert.match(css, /\.binary-card\.selected/);
-  assert.match(css, /\.binary-checkbox/);
+  assert.match(css, /var\(--bg-canvas/);
+  assert.match(css, /var\(--text-primary/);
 
-  const appJs = readFileSync(join(BOARD_DIR, 'app.js'), 'utf-8');
-  assert.doesNotMatch(appJs, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
-  assert.match(appJs, /window\.sidecar\?\.ui\?\.toggleConversation/);
-  assert.match(appJs, /window\.sidecar\?\.agent\?\.sendMessage/);
-  assert.match(appJs, /window\.sidecar\.getWorkspaceUris/);
-  assert.match(appJs, /window\.sidecar\.onWorkspaceChange/);
+  const clientSrc = readFileSync(join(BOARD_DIR, 'frontend', 'src', 'lib', 'api', 'sidecarClient.ts'), 'utf-8');
+  const storeSrc = readFileSync(join(BOARD_DIR, 'frontend', 'src', 'lib', 'state', 'boardStore.svelte.ts'), 'utf-8');
+  assert.doesNotMatch(clientSrc + storeSrc, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
+  assert.match(clientSrc, /toggleConversation/);
+  assert.match(clientSrc, /sendMessage/);
+  assert.match(clientSrc, /getWorkspaceUris/);
+  assert.match(clientSrc, /onWorkspaceChange/);
 
   const jsFiles = [
     'main.mjs',
     'lock_db.mjs',
+    'claim_db.mjs',
+    'telemetry_readers.mjs',
+    'telemetry_board.mjs',
     'tooling_xray.mjs',
+    'xray_uml_mermaid.mjs',
+    'xray_uml.mjs',
+    'xray_actions.mjs',
     'watchdog.mjs',
     'router.mjs',
-    'app.js',
   ];
   for (const file of jsFiles) {
     await execFileAsync(process.execPath, ['--check', join(BOARD_DIR, file)]);
@@ -1091,19 +1096,24 @@ test('inspectOwnerActivity and readDbSnapshot classify active task-log vs stalle
     assert.equal(directAct.healthState, 'active');
     assert.equal(directAct.activitySource, 'transcript');
 
-    const html = readFileSync(join(BOARD_DIR, 'index.html'), 'utf-8');
-    const appJs = readFileSync(join(BOARD_DIR, 'app.js'), 'utf-8');
-    assert.ok(html.includes('id="stall-alert-banner"'));
-    assert.ok(appJs.includes('makeTooltipText'));
-    assert.ok(appJs.includes('makeHealthBadge'));
-    assert.ok(!appJs.includes('innerHTML'));
+    const locksPanelSrc = readFileSync(
+      join(BOARD_DIR, 'frontend', 'src', 'lib', 'components', 'LocksPanel.svelte'),
+      'utf-8'
+    );
+    const taskCardSrc = readFileSync(
+      join(BOARD_DIR, 'frontend', 'src', 'lib', 'components', 'TaskCard.svelte'),
+      'utf-8'
+    );
+    assert.ok(locksPanelSrc.includes('pill-blocked'));
+    assert.ok(taskCardSrc.includes('dot-blocked'));
+    assert.doesNotMatch(locksPanelSrc + taskCardSrc, /innerHTML/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test('readDbSnapshot and /api/state expose guardSettings, ownerLockCount, and LIMIT_DENIED/DEP_GUARD_DENIED events', async () => {
-  assert.equal(DEFAULT_MAX_LOCKS_PER_SESSION, 4);
+  assert.equal(DEFAULT_MAX_LOCKS_PER_SESSION, 8);
   assert.equal(DEFAULT_MAX_SHARED_DEPS_WITHOUT_NODEPS, 3);
 
   const dir = makeTempDir();
@@ -1127,7 +1137,7 @@ test('readDbSnapshot and /api/state expose guardSettings, ownerLockCount, and LI
       const emptyState = await emptyStateRes.json();
       assert.equal(emptyState.dbExists, false);
       assert.deepEqual(emptyState.guardSettings, {
-        maxLocksPerSession: 4,
+        maxLocksPerSession: 8,
         maxSharedDepsWithoutNodeps: 3,
       });
     } finally {
@@ -1141,7 +1151,7 @@ test('readDbSnapshot and /api/state expose guardSettings, ownerLockCount, and LI
       summaryDbPaths: [],
     });
     assert.deepEqual(defaultSnap.guardSettings, {
-      maxLocksPerSession: 4,
+      maxLocksPerSession: 8,
       maxSharedDepsWithoutNodeps: 3,
     });
 
@@ -1156,7 +1166,7 @@ test('readDbSnapshot and /api/state expose guardSettings, ownerLockCount, and LI
       summaryDbPaths: [],
     });
     assert.deepEqual(fallbackSnap.guardSettings, {
-      maxLocksPerSession: 4,
+      maxLocksPerSession: 8,
       maxSharedDepsWithoutNodeps: 3,
     });
 
@@ -1246,288 +1256,89 @@ test('readDbSnapshot and /api/state expose guardSettings, ownerLockCount, and LI
       await new Promise((resolveClose) => server.close(resolveClose));
     }
 
-    const appJs = readFileSync(join(BOARD_DIR, 'app.js'), 'utf-8');
-    const stylesCss = readFileSync(join(BOARD_DIR, 'styles.css'), 'utf-8');
-    assert.doesNotMatch(appJs, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
-    assert.ok(appJs.includes('ownerLockCount'));
-    assert.ok(appJs.includes('guardSettings'));
-    assert.ok(appJs.includes('LIMIT_DENIED'));
-    assert.ok(appJs.includes('DEP_GUARD_DENIED'));
-    assert.ok(appJs.includes('세션 락 상한 초과 차단'));
-    assert.ok(appJs.includes('연쇄 공유 모듈 빌드 차단 (--no-dependencies 필요)'));
-    assert.ok(appJs.includes('badge-warning'));
-    assert.ok(stylesCss.includes('.quota-badge'));
+    const locksPanelSrc = readFileSync(
+      join(BOARD_DIR, 'frontend', 'src', 'lib', 'components', 'LocksPanel.svelte'),
+      'utf-8'
+    );
+    const distCss = readFileSync(join(BOARD_DIR, 'dist', 'styles.css'), 'utf-8');
+    assert.doesNotMatch(locksPanelSrc, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
+    assert.ok(locksPanelSrc.includes('ownerLockCount'));
+    assert.ok(locksPanelSrc.includes('maxLocksPerSession'));
+    assert.ok(locksPanelSrc.includes('quota-badge'));
+    assert.ok(distCss.includes('.quota-badge') || distCss.includes('quota-badge'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('Tooling tab multi-select checkboxes survive refresh and Execute sends combined prompt via sidecar.agent.sendMessage', async () => {
-  class FakeClassList {
-    constructor(owner) {
-      this.owner = owner;
-      this.set = new Set();
-    }
-    syncFromString(str) {
-      this.set = new Set(String(str || '').split(/\s+/).filter(Boolean));
-    }
-    add(...cls) {
-      for (const c of cls) this.set.add(c);
-    }
-    remove(...cls) {
-      for (const c of cls) this.set.delete(c);
-    }
-    toggle(c, force) {
-      if (force === undefined) {
-        if (this.set.has(c)) this.set.delete(c);
-        else this.set.add(c);
-        return this.set.has(c);
-      }
-      if (force) this.set.add(c);
-      else this.set.delete(c);
-      return Boolean(force);
-    }
-    contains(c) {
-      return this.set.has(c);
-    }
-  }
+test('Svelte domain pure helpers build combined tooling prompt, group Kanban columns, and compute UML SVG layout', async () => {
+  const { buildToolingPrompt, groupTasksByColumn } = await import(
+    '../frontend/src/lib/domain/boardPure.ts'
+  );
+  const { computeUmlDiagramLayout } = await import(
+    '../frontend/src/lib/domain/umlLayoutPure.ts'
+  );
 
-  class FakeElement {
-    constructor(tagName, id = '') {
-      this.tagName = tagName.toUpperCase();
-      this.id = id;
-      this.attributes = {};
-      this.dataset = {};
-      this.children = [];
-      this.listeners = new Map();
-      this.classList = new FakeClassList(this);
-      this._className = '';
-      this._textContent = '';
-      this.checked = false;
-      this.disabled = false;
-      this.value = '';
-      this.hidden = false;
-    }
-    get className() {
-      return [...this.classList.set].join(' ');
-    }
-    set className(val) {
-      this._className = String(val || '');
-      this.classList.syncFromString(this._className);
-    }
-    get firstChild() {
-      return this.children[0] || null;
-    }
-    removeChild(child) {
-      const idx = this.children.indexOf(child);
-      if (idx >= 0) this.children.splice(idx, 1);
-    }
-    append(...nodes) {
-      for (const n of nodes) {
-        this.children.push(typeof n === 'string' ? { nodeType: 3, textContent: n } : n);
-      }
-    }
-    appendChild(node) {
-      this.append(node);
-      return node;
-    }
-    setAttribute(k, v) {
-      this.attributes[k] = String(v);
-      if (k === 'id') this.id = String(v);
-    }
-    getAttribute(k) {
-      return this.attributes[k] ?? null;
-    }
-    addEventListener(type, fn) {
-      if (!this.listeners.has(type)) this.listeners.set(type, []);
-      this.listeners.get(type).push(fn);
-    }
-    async dispatch(type, extra = {}) {
-      const list = this.listeners.get(type) || [];
-      for (const fn of list) {
-        await fn({ target: this, preventDefault() {}, ...extra });
-      }
-    }
-    get textContent() {
-      return this._textContent;
-    }
-    set textContent(v) {
-      this._textContent = String(v ?? '');
-    }
-    get text() {
-      return this._textContent;
-    }
-    focus() {}
-  }
-
-  const byId = new Map();
-  const reg = (tag, id, extra = {}) => {
-    const node = new FakeElement(tag, id);
-    Object.assign(node, extra);
-    byId.set(id, node);
-    return node;
-  };
-  const tabs = [
-    reg('button', 'tabbtn-locks', { dataset: { tab: 'locks' } }),
-    reg('button', 'tabbtn-tooling', { dataset: { tab: 'tooling' } }),
+  const binaries = [
+    {
+      id: 'code-xray',
+      label: 'CodeXrayMcp',
+      category: 'MCP Server',
+      summary: 'Multi-language MCP',
+      description: 'MCP server',
+      actionHint: 'Run code-xray MCP analysis.',
+      exists: true,
+      path: 'C:\\bin\\CodeXrayMcp.exe',
+    },
+    {
+      id: 'structural-clone',
+      label: 'structural-clone',
+      category: 'CLI Analyzer',
+      summary: 'Clone detector',
+      description: 'AST clone scanner',
+      actionHint: 'Run structural-clone scan.',
+      exists: true,
+      path: 'C:\\bin\\structural-clone.exe',
+    },
   ];
-  for (const id of [
-    'toast', 'tab-locks', 'tab-tooling', 'lock-filter', 'auto-wake-toggle', 'refresh-btn',
-    'live-status', 'live-label', 'stat-locks', 'stat-queue', 'stat-next', 'stat-next-pill',
-    'stat-wake', 'stat-ws', 'stat-ws-pill', 'tab-count-locks', 'tab-count-tooling',
-    'stall-alert-banner', 'next-up-section', 'next-up-count', 'next-up-list',
-    'locks-count', 'locks-tbody', 'locks-table-wrap', 'locks-empty',
-    'queue-count', 'queue-tbody', 'queue-table-wrap', 'queue-empty',
-    'recent-wakes-count', 'recent-wakes-list', 'tooling-json-status', 'tooling-roots',
-    'tooling-selection-summary', 'tooling-clear-btn', 'tooling-execute-btn', 'tooling-binaries',
-    'xray-ws-count', 'xray-workspaces', 'reviews-count', 'xray-reviews', 'events-count', 'events-list',
-  ]) {
-    reg('div', id);
-  }
-  byId.get('tooling-clear-btn').disabled = true;
-  byId.get('tooling-execute-btn').disabled = true;
 
-  const sampleState = {
-    locks: [],
-    lock_queue: [],
-    nextUp: [],
-    lock_events: [],
-    autoWakeEnabled: true,
-    guardSettings: { maxLocksPerSession: 4, maxSharedDepsWithoutNodeps: 3 },
-    tooling: {
-      toolingJsonExists: true,
-      toolingJsonPath: 'C:\\tmp\\tooling.json',
-      rootInfo: [],
-      binaries: [
-        {
-          id: 'code-xray',
-          label: 'CodeXrayMcp',
-          category: 'MCP Server',
-          summary: 'Multi-language MCP',
-          description: 'MCP server',
-          actionHint: 'Run code-xray MCP analysis.',
-          exists: true,
-          sizeBytes: 1024,
-        },
-        {
-          id: 'structural-clone',
-          label: 'structural-clone',
-          category: 'CLI Analyzer',
-          summary: 'Clone detector',
-          description: 'AST clone scanner',
-          actionHint: 'Run structural-clone scan.',
-          exists: true,
-          sizeBytes: 2048,
-        },
-      ],
-    },
-    xray: {
-      activeWorkspaces: ['D:\\Workspace\\DemoRepo'],
-      workspaces: [],
-    },
-  };
+  const prompt = buildToolingPrompt(
+    ['code-xray', 'structural-clone'],
+    binaries,
+    ['D:\\Workspace\\DemoRepo']
+  );
+  assert.match(prompt, /D:\\Workspace\\DemoRepo/);
+  assert.match(prompt, /CodeXrayMcp \(code-xray\)/);
+  assert.match(prompt, /structural-clone/);
+  assert.match(prompt, /Run code-xray MCP analysis\./);
+  assert.match(prompt, /Run structural-clone scan\./);
 
-  const sentMessages = [];
-  const fakeDoc = {
-    hidden: false,
-    documentElement: new FakeElement('html'),
-    getElementById: (id) => byId.get(id) || null,
-    createElement: (tag) => new FakeElement(tag),
-    createTextNode: (txt) => ({ nodeType: 3, textContent: String(txt) }),
-    querySelectorAll: (sel) => (sel === '.tab' ? tabs : []),
-    addEventListener: () => {},
-  };
-  const fakeWindow = {
-    sidecar: {
-      conversationId: 'conv-active-1',
-      fetch: async () => ({
-        ok: true,
-        status: 200,
-        text: async () => JSON.stringify(sampleState),
-      }),
-      onWorkspaceChange: () => () => {},
-      getWorkspaceUris: async () => ['file:///D:/Workspace/DemoRepo'],
-      agent: {
-        sendMessage: async (message) => {
-          sentMessages.push(message);
-          return { ok: true };
-        },
-      },
-      ui: { toggleConversation: () => {} },
-    },
-  };
+  const buckets = groupTasksByColumn([
+    { id: '1', status: 'todo' },
+    { id: '2', status: 'in_progress' },
+    { id: '3', status: 'blocked' },
+    { id: '4', status: 'done' },
+  ]);
+  assert.equal(buckets.todo.length, 1);
+  assert.equal(buckets.in_progress.length, 1);
+  assert.equal(buckets.blocked.length, 1);
+  assert.equal(buckets.done.length, 1);
 
-  const timers = [];
-  const ctx = createContext({
-    Node: FakeElement,
-    document: fakeDoc,
-    window: fakeWindow,
-    navigator: {},
-    getComputedStyle: () => ({ backgroundColor: 'rgb(20, 20, 20)' }),
-    MutationObserver: class { observe() {} },
-    setTimeout: (fn) => {
-      const id = timers.length + 1;
-      timers.push(fn);
-      return id;
-    },
-    clearTimeout: () => {},
-    setInterval: () => 999,
-    clearInterval: () => {},
-    URLSearchParams,
-    console,
-  });
+  const layout = computeUmlDiagramLayout(
+    [
+      { id: 'A', name: 'A', fullName: 'A', kind: 'class', subtitle: 'UI', rank: 0, isFocus: true, members: [] },
+      { id: 'B', name: 'B', fullName: 'B', kind: 'interface', subtitle: 'Core', rank: 1, isFocus: false, members: [] },
+    ],
+    [{ from: 'A', to: 'B', relation: 'implements', label: 'DI' }]
+  );
+  assert.equal(layout.nodes.length, 2);
+  assert.equal(layout.edges.length, 1);
+  assert.equal(layout.edges[0].dashed, true);
 
-  const appSource = readFileSync(join(BOARD_DIR, 'app.js'), 'utf-8');
-  runInNewContext(appSource, ctx);
-  const flush = async () => {
-    for (let i = 0; i < 6; i += 1) {
-      await new Promise((r) => setImmediate(r));
-    }
-  };
-  await flush();
-  assert.equal(byId.get('toast').classList.contains('error'), false, byId.get('toast').textContent);
-
-  const collectCheckboxes = () => {
-    const cards = byId.get('tooling-binaries').children;
-    const boxes = [];
-    for (const card of cards) {
-      const head = card.children[0];
-      const titleWrap = head.children[0];
-      const cb = titleWrap.children[0];
-      boxes.push({ card, cb, id: card.dataset.toolId });
-    }
-    return boxes;
-  };
-
-  let boxes = collectCheckboxes();
-  assert.equal(boxes.length, 2);
-  assert.equal(byId.get('tooling-execute-btn').disabled, true);
-
-  // Select both tools
-  boxes[0].cb.checked = true;
-  await boxes[0].cb.dispatch('change');
-  boxes[1].cb.checked = true;
-  await boxes[1].cb.dispatch('change');
-  assert.equal(byId.get('tooling-execute-btn').disabled, false);
-  assert.equal(byId.get('tooling-execute-btn').textContent, 'Execute (2)');
-
-  // Simulate poll refresh (Click Refresh button) and verify both checkboxes stay checked
-  await byId.get('refresh-btn').dispatch('click');
-  await flush();
-  boxes = collectCheckboxes();
-  assert.equal(boxes[0].cb.checked, true);
-  assert.equal(boxes[1].cb.checked, true);
-  assert.ok(boxes[0].card.classList.contains('selected'));
-  assert.ok(boxes[1].card.classList.contains('selected'));
-
-  // Execute -> sends combined prompt via sidecar.agent.sendMessage and clears selection
-  await byId.get('tooling-execute-btn').dispatch('click');
-  await flush();
-  assert.equal(sentMessages.length, 1);
-  assert.match(sentMessages[0], /D:\\Workspace\\DemoRepo/);
-  assert.match(sentMessages[0], /CodeXrayMcp.*code-xray/);
-  assert.match(sentMessages[0], /structural-clone/);
-  assert.match(sentMessages[0], /Run code-xray MCP analysis\./);
-  assert.match(sentMessages[0], /Run structural-clone scan\./);
-  assert.equal(byId.get('tooling-execute-btn').disabled, true);
+  const xrayPanelSrc = readFileSync(
+    join(BOARD_DIR, 'frontend', 'src', 'lib', 'components', 'XrayPanel.svelte'),
+    'utf-8'
+  );
+  assert.match(xrayPanelSrc, /Execute \(\{selectedToolIds\.length\}\)/);
+  assert.match(xrayPanelSrc, /ByteRAG Workspace Cache/);
 });

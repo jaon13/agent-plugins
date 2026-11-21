@@ -19,14 +19,22 @@ import {
   defaultSummaryDbPaths,
   openLockDb,
   prepareManualWakeByQueueId,
+  readActiveClaims,
+  readConversationSummaries,
   readDbSnapshot,
   resolveLockDbPath,
   setAutoWakeEnabled,
 } from './lock_db.mjs';
+import { buildBoardTasks } from './telemetry_board.mjs';
 import { getToolingSnapshot, getXraySnapshot, parseWorkspacesParam } from './tooling_xray.mjs';
+import { runXrayConsistencyCheck, runXrayRefresh } from './xray_actions.mjs';
+import { buildFocusedUmlGraph } from './xray_uml.mjs';
 import { runProjectLockUnlock, wakePromotions } from './watchdog.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_STATIC_DIR = existsSync(join(__dirname, 'dist', 'index.html'))
+  ? join(__dirname, 'dist')
+  : __dirname;
 
 const STATIC_FILES = {
   '/': ['index.html', 'text/html; charset=utf-8'],
@@ -47,7 +55,7 @@ export function createLockBoardController({
   dbPath,
   toolingJsonPath,
   summaryDbPaths = defaultSummaryDbPaths(),
-  staticDir = __dirname,
+  staticDir = DEFAULT_STATIC_DIR,
   ttlSeconds = DEFAULT_TTL_SECONDS,
   suspectSeconds,
   longSeconds,
@@ -57,6 +65,9 @@ export function createLockBoardController({
   activityChecker,
   unlockRunner = runProjectLockUnlock,
   wakeRunner,
+  brainRoots,
+  execRunner,
+  homeDir,
   app = null,
   nowFn = () => Date.now() / 1000,
   env = process.env,
@@ -77,13 +88,15 @@ export function createLockBoardController({
     const resolvedDbPath = getDbPath();
     const dbExists = existsSync(resolvedDbPath);
     const activeWorkspaces = parseWorkspacesParam(query.workspaces);
+    const nowSec = nowFn();
 
     let dbSnap;
+    let claims = [];
     if (dbExists) {
       const db = openLockDb(resolvedDbPath);
       try {
         dbSnap = await readDbSnapshot(db, {
-          now: nowFn(),
+          now: nowSec,
           ttlSeconds,
           suspectSeconds,
           longSeconds,
@@ -93,12 +106,17 @@ export function createLockBoardController({
           activityChecker,
           summaryDbPaths,
         });
+        claims = readActiveClaims(db, {
+          now: nowSec,
+          ttlSeconds,
+          locks: dbSnap.locks,
+        });
       } finally {
         db.close();
       }
     } else {
       dbSnap = {
-        now: nowFn(),
+        now: nowSec,
         autoWakeEnabled: true,
         guardSettings: {
           maxLocksPerSession: DEFAULT_MAX_LOCKS_PER_SESSION,
@@ -118,6 +136,18 @@ export function createLockBoardController({
       };
     }
 
+    const summaryMap = new Map();
+    for (const lk of dbSnap.locks) {
+      if (lk.ownerId && (lk.ownerTitle || lk.ownerWorkspaceName)) {
+        summaryMap.set(lk.ownerId, { title: lk.ownerTitle || '', workspaceName: lk.ownerWorkspaceName || '' });
+      }
+    }
+    for (const q of dbSnap.lock_queue) {
+      if (q.waiterConvId && (q.waiterTitle || q.waiterWorkspaceName)) {
+        summaryMap.set(q.waiterConvId, { title: q.waiterTitle || '', workspaceName: q.waiterWorkspaceName || '' });
+      }
+    }
+
     const fallbackWorkspaces = [
       ...dbSnap.locks.map((lk) => lk.workspace).filter(Boolean),
       ...dbSnap.lock_queue.map((q) => q.waiterWorkspace).filter(Boolean),
@@ -125,9 +155,23 @@ export function createLockBoardController({
 
     const tooling = getToolingSnapshot({ toolingJsonPath });
     const xray = getXraySnapshot({ activeWorkspaces, fallbackWorkspaces });
+    const board = buildBoardTasks({
+      locks: dbSnap.locks,
+      claims,
+      queue: dbSnap.lock_queue,
+      events: dbSnap.lock_events,
+      summaryMap,
+      summaryLookup: (ids) => readConversationSummaries(ids, summaryDbPaths),
+      brainRoots,
+      now: dbSnap.now,
+    });
 
     return {
       ...dbSnap,
+      claims,
+      claimCount: claims.length,
+      boardTasks: board.tasks,
+      boardCounts: board.counts,
       dbPath: resolvedDbPath,
       dbExists,
       tooling,
@@ -277,6 +321,51 @@ export function createLockBoardController({
     );
   }
 
+  async function resolveTargetWorkspace(data = {}) {
+    const state = await buildStatePayload(data);
+    const explicit = String(data.workspace ?? '').trim();
+    const allowedWorkspaces = (state.xray?.workspaces || []).map((w) => w.workspacePath).filter(Boolean);
+    const chosen = explicit || allowedWorkspaces[0] || '';
+    return { state, chosen, allowedWorkspaces };
+  }
+
+  async function handleGetXrayUml(data = {}) {
+    const { chosen } = await resolveTargetWorkspace(data);
+    if (!chosen) {
+      return makeJsonResponse({ ok: false, error: 'No active workspace available', nodes: [], edges: [], availableTargets: [], mermaid: '' }, 400);
+    }
+    const graph = buildFocusedUmlGraph(chosen, {
+      mode: String(data.mode || 'type'),
+      focus: String(data.focus || ''),
+      hops: Number(data.hops || 1),
+    });
+    return makeJsonResponse(graph, 200);
+  }
+
+  async function handlePostXrayRefresh(data = {}) {
+    const { state, chosen, allowedWorkspaces } = await resolveTargetWorkspace(data);
+    const result = await runXrayRefresh({
+      workspacePath: chosen,
+      tooling: state.tooling,
+      allowedWorkspaces,
+      execRunner,
+      homeDir,
+    });
+    const nextState = result.ok ? await buildStatePayload(data) : state;
+    return makeJsonResponse({ ...result, state: nextState }, result.status || 200);
+  }
+
+  async function handlePostXrayCheck(data = {}) {
+    const { chosen, allowedWorkspaces } = await resolveTargetWorkspace(data);
+    const result = await runXrayConsistencyCheck({
+      workspacePath: chosen,
+      allowedWorkspaces,
+      execRunner,
+      homeDir,
+    });
+    return makeJsonResponse(result, result.status || 200);
+  }
+
   return {
     getDbPath,
     readStatic,
@@ -286,6 +375,9 @@ export function createLockBoardController({
     handlePostQueueCancel,
     handlePostAutoWake,
     handlePostWake,
+    handleGetXrayUml,
+    handlePostXrayRefresh,
+    handlePostXrayCheck,
   };
 }
 
@@ -328,6 +420,12 @@ export function createStandaloneHttpServer(controller) {
         let resp = null;
         if (method === 'GET' && url.pathname === '/api/state') {
           resp = await controller.handleGetState(data);
+        } else if (method === 'GET' && url.pathname === '/api/xray/uml') {
+          resp = await controller.handleGetXrayUml(data);
+        } else if (method === 'POST' && url.pathname === '/api/xray/refresh') {
+          resp = await controller.handlePostXrayRefresh(data);
+        } else if (method === 'POST' && url.pathname === '/api/xray/check') {
+          resp = await controller.handlePostXrayCheck(data);
         } else if (method === 'POST' && url.pathname === '/api/unlock') {
           resp = await controller.handlePostUnlock(data);
         } else if (method === 'POST' && url.pathname === '/api/queue/cancel') {

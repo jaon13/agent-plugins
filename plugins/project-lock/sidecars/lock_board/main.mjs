@@ -44,6 +44,9 @@ export async function startSidecar(options = {}) {
     app.api('/app.js', () => wrap(controller.readStatic('/app.js')), 'GET');
     app.api('/styles.css', () => wrap(controller.readStatic('/styles.css')), 'GET');
     app.api('/api/state', async (data) => wrap(await controller.handleGetState(data)), 'GET');
+    app.api('/api/xray/uml', async (data) => wrap(await controller.handleGetXrayUml(data)), 'GET');
+    app.api('/api/xray/refresh', async (data) => wrap(await controller.handlePostXrayRefresh(data)), 'POST');
+    app.api('/api/xray/check', async (data) => wrap(await controller.handlePostXrayCheck(data)), 'POST');
     app.api('/api/unlock', async (data) => wrap(await controller.handlePostUnlock(data)), 'POST');
     app.api(
       '/api/queue/cancel',

@@ -10,6 +10,9 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { cleanupExpiredClaimsTx, ensureClaimSchema, readActiveClaims } from './claim_db.mjs';
+
+export { ensureClaimSchema, readActiveClaims };
 
 const execFileAsync = promisify(execFile);
 
@@ -17,7 +20,7 @@ export const DEFAULT_TTL_SECONDS = 1200;
 export const RESERVATION_TTL_SECONDS = 60;
 export const STALL_SUSPECT_SECONDS = 180;
 export const STALL_LONG_SECONDS = 600;
-export const DEFAULT_MAX_LOCKS_PER_SESSION = 4;
+export const DEFAULT_MAX_LOCKS_PER_SESSION = 8;
 export const DEFAULT_MAX_SHARED_DEPS_WITHOUT_NODEPS = 3;
 export const BUSY_TIMEOUT_MS = 5000;
 export const EVENT_LIMIT = 40;
@@ -224,6 +227,9 @@ function mapQueueRow(row, position = 0) {
     id: Number(row.id),
     requestGroupId: String(row.request_group_id ?? ''),
     moduleKey: String(row.module_key ?? ''),
+    scopeKey: String(row.scope_key ?? ''),
+    lockMode: String(row.lock_mode || 'BUILD_EXCL'),
+    fileRelpath: String(row.file_relpath ?? ''),
     waiterConvId: String(row.waiter_conv_id ?? ''),
     waiterProjectId: String(row.waiter_project_id ?? ''),
     waiterWorkspace: String(row.waiter_workspace ?? ''),
@@ -446,6 +452,7 @@ export function sweepExpiredAndPromote(
       }
 
       delPromotedStmt.run(modKey, ownerId);
+      cleanupExpiredClaimsTx(db, modKey, ownerId);
       delLockStmt.run(modKey);
       expiredKeys.push(modKey);
     }

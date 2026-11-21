@@ -275,11 +275,13 @@ export function inspectIndexDb(indexDbPath) {
       // Older or partial index schema without meta table.
     }
 
+    const stateTransitions = readTableCount(db, 'state_transitions');
     const counts = {
       projects: readTableCount(db, 'projects'),
       files: readTableCount(db, 'files'),
       types: readTableCount(db, 'types'),
       members: readTableCount(db, 'members'),
+      ...(stateTransitions !== null ? { stateTransitions } : {}),
     };
 
     const updatedEpoch = meta.updated_epoch ? Number(meta.updated_epoch) : null;
@@ -433,11 +435,64 @@ export function inspectReviewsDir(reviewsDir) {
   return files.slice(0, MAX_REVIEWS).map((f) => summarizeReviewManifest(f.full, f.st));
 }
 
-export function inspectWorkspaceXray(workspacePath, source = 'active') {
+function inspectKnowledgeDir(dirPath) {
+  const st = statSafe(dirPath);
+  if (!st.exists || st.isFile) {
+    return { exists: false, path: dirPath, docCount: 0, latestMtimeMs: null };
+  }
+  let docCount = 0;
+  let latestMtimeMs = st.mtimeMs;
+  try {
+    for (const ent of readdirSync(dirPath, { withFileTypes: true })) {
+      if (!ent.isFile() || !ent.name.toLowerCase().endsWith('.md')) continue;
+      docCount += 1;
+      const fst = statSafe(join(dirPath, ent.name));
+      if (fst.mtimeMs && (!latestMtimeMs || fst.mtimeMs > latestMtimeMs)) {
+        latestMtimeMs = fst.mtimeMs;
+      }
+    }
+  } catch {
+    // Ignore unreadable cache entries.
+  }
+  return { exists: true, path: dirPath, docCount, latestMtimeMs };
+}
+
+export function inspectByteRagCache(workspacePath, homeDir = homedir(), indexUpdatedEpoch = null) {
+  const wsNorm = normalizeWorkspacePath(workspacePath);
+  const wsBin = wsNorm ? join(wsNorm, '.agents', 'cache', 'byterag_index.bin') : '';
+  const globalBin = join(homeDir, '.agents', 'cache', 'byterag_index.bin');
+  const wsBinSt = wsBin ? statSafe(wsBin) : { exists: false };
+  const binPath = wsBinSt.exists ? wsBin : globalBin;
+  const binSt = wsBinSt.exists ? wsBinSt : statSafe(globalBin);
+
+  const wsKb = wsNorm ? join(wsNorm, '.agents', 'cache', 'bytebrain_knowledge') : '';
+  const globalKb = join(homeDir, '.agents', 'cache', 'bytebrain_knowledge');
+  const wsKbInfo = wsKb ? inspectKnowledgeDir(wsKb) : { exists: false };
+  const knowledge = wsKbInfo.exists ? wsKbInfo : inspectKnowledgeDir(globalKb);
+
+  const scope = wsBinSt.exists || wsKbInfo.exists ? 'workspace' : binSt.exists || knowledge.exists ? 'global' : 'missing';
+  const indexMs = typeof indexUpdatedEpoch === 'number' && indexUpdatedEpoch > 0 ? indexUpdatedEpoch * 1000 : null;
+  const binStale = Boolean(binSt.exists && indexMs && binSt.mtimeMs && indexMs - binSt.mtimeMs > 600_000);
+
+  return {
+    scope,
+    indexBin: {
+      exists: Boolean(binSt.exists && binSt.isFile),
+      path: binPath,
+      sizeBytes: binSt.sizeBytes ?? 0,
+      mtimeMs: binSt.mtimeMs ?? null,
+      stale: binStale,
+    },
+    knowledgeDir: knowledge,
+  };
+}
+
+export function inspectWorkspaceXray(workspacePath, source = 'active', homeDir = homedir()) {
   const norm = normalizeWorkspacePath(workspacePath);
   const xrayDir = join(norm, '.xray');
   const indexDb = inspectIndexDb(join(xrayDir, 'index.db'));
   const reviews = inspectReviewsDir(join(xrayDir, 'reviews'));
+  const byteRag = inspectByteRagCache(norm, homeDir, indexDb.updatedEpoch ?? null);
   return {
     workspacePath: norm,
     name: basename(norm) || norm,
@@ -445,7 +500,32 @@ export function inspectWorkspaceXray(workspacePath, source = 'active') {
     xrayDirExists: existsSync(xrayDir),
     indexDb,
     reviews,
+    byteRag,
   };
+}
+
+const SKIP_SUBDIRS = new Set(['node_modules', 'bin', 'obj', 'dist', 'build', 'target']);
+const MAX_SUBPROJECT_SCAN = 24;
+
+function discoverSubprojectWorkspaces(parentDir) {
+  if (!parentDir || !existsSync(parentDir)) return [];
+  const discovered = [];
+  try {
+    for (const ent of readdirSync(parentDir, { withFileTypes: true })) {
+      if (discovered.length >= MAX_SUBPROJECT_SCAN) break;
+      if (!ent.isDirectory()) continue;
+      if (ent.name.startsWith('.') || ent.name.startsWith('_') || SKIP_SUBDIRS.has(ent.name.toLowerCase())) {
+        continue;
+      }
+      const subPath = join(parentDir, ent.name);
+      const hasXray = existsSync(join(subPath, '.xray', 'index.db')) || existsSync(join(subPath, '.xray', 'reviews'));
+      const hasByteRag = existsSync(join(subPath, '.agents', 'cache', 'byterag_index.bin'));
+      if (hasXray || hasByteRag) discovered.push(subPath);
+    }
+  } catch {
+    // Ignore unreadable directories during subproject scan.
+  }
+  return discovered;
 }
 
 export function getXraySnapshot({ activeWorkspaces = [], fallbackWorkspaces = [] } = {}) {
@@ -457,15 +537,23 @@ export function getXraySnapshot({ activeWorkspaces = [], fallbackWorkspaces = []
   const isWin = process.platform === 'win32';
 
   const addTarget = (ws, source) => {
-    const key = isWin ? ws.toLowerCase() : ws;
+    const norm = normalizeWorkspacePath(ws);
+    if (!norm) return;
+    const key = isWin ? norm.toLowerCase() : norm;
     if (seen.has(key)) return;
     seen.add(key);
-    targets.push({ ws, source });
+    targets.push({ ws: norm, source });
   };
 
   for (const ws of activeList) addTarget(ws, 'active');
   if (targets.length === 0) {
     for (const ws of fallbackList) addTarget(ws, 'lock');
+  }
+
+  for (const baseTarget of [...targets]) {
+    for (const subPath of discoverSubprojectWorkspaces(baseTarget.ws)) {
+      addTarget(subPath, 'subproject');
+    }
   }
 
   return {
